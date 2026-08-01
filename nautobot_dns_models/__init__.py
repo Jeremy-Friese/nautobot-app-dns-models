@@ -91,6 +91,14 @@ class NautobotDnsModelsConfig(NautobotAppConfig):
             help_text="Enforce CNAME exclusivity",
             field_type=bool,
         ),
+        "SOA_SERIAL_AUTO_INCREMENT": ConstanceConfigItem(
+            default=False,
+            help_text=(
+                "Automatically increment SOA serial number when zone data changes. "
+                "Incompatible with date-based serial schemes (e.g., YYYYMMDDNN)."
+            ),
+            field_type=bool,
+        ),
     }
 
 

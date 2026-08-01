@@ -251,6 +251,18 @@ def get_default_view_pk():
 class DNSZone(DNSModel):
     """Model for DNS SOA Records. An SOA Record defines a DNS Zone."""
 
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        """Capture the DB-loaded serial so clean() can detect intentional changes."""
+        instance = super().from_db(db, field_names, values)
+        instance._initial_soa_serial = instance.soa_serial
+        return instance
+
+    def refresh_from_db(self, *args, **kwargs):
+        """Update the captured serial after a DB refresh."""
+        super().refresh_from_db(*args, **kwargs)
+        self._initial_soa_serial = self.soa_serial
+
     name = models.CharField(max_length=200, help_text="FQDN of the Zone, w/ TLD. e.g example.com")
     dns_view = ForeignKeyWithAutoRelatedName(
         DNSView,
@@ -425,8 +437,13 @@ class DNSZone(DNSModel):
         """Reject manual SOA serial changes while automatic incrementing is enabled."""
         super().clean()
         if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT and self.present_in_database:
-            db_serial = DNSZone.objects.values_list("soa_serial", flat=True).get(pk=self.pk)
-            if self.soa_serial != db_serial:
+            # Compare against the serial as loaded when this instance was fetched from the database
+            # (_initial_soa_serial set by from_db/refresh_from_db), not the current DB value.
+            # This validates the user's intent: did they change the serial from what they loaded?
+            # Using the current DB value would cause false rejections when a concurrent increment
+            # occurs between form render and submission.
+            initial = getattr(self, "_initial_soa_serial", None)
+            if initial is not None and self.soa_serial != initial:
                 raise ValidationError(
                     {
                         "soa_serial": (
@@ -587,10 +604,12 @@ class DNSRecord(DNSModel):
         if not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
             return super().delete(*args, **kwargs)
 
-        zone = self.zone  # pylint: disable=no-member
         with transaction.atomic():
+            # Lock and re-read to get the definitive zone as of this transaction,
+            # guarding against a concurrent zone change on the record.
+            zone_id = type(self).objects.select_for_update().values_list("zone_id", flat=True).get(pk=self.pk)
             result = super().delete(*args, **kwargs)
-            zone.increment_soa_serial()  # pylint: disable=no-member
+            DNSZone.objects.get(pk=zone_id).increment_soa_serial()
         return result
 
     def clean(self):

@@ -583,6 +583,11 @@ class DNSRecord(DNSModel):
 
     def save(self, *args, **kwargs):
         """Increment the affected zones' SOA serials after every record save."""
+        # Normalize update_fields once (consuming any generator) and write back into kwargs.
+        raw_update_fields = kwargs.get("update_fields")
+        if raw_update_fields is not None:
+            kwargs["update_fields"] = frozenset(raw_update_fields)
+
         # Empty update_fields is a no-op per Django's contract — pass straight through.
         if kwargs.get("update_fields") is not None and not kwargs["update_fields"]:
             super().save(*args, **kwargs)

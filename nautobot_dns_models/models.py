@@ -372,6 +372,8 @@ class DNSZone(DNSModel):
 
         self.soa_serial = zone.soa_serial
         dirty[self.pk] = zone.soa_serial
+        # Keep the intent snapshot in sync so clean() reflects the current state.
+        self._initial_soa_serial = zone.soa_serial
 
     def save(self, *args, **kwargs):
         """Override save to detect zone self-changes and trigger serial increment."""
@@ -581,15 +583,24 @@ class DNSRecord(DNSModel):
 
     def save(self, *args, **kwargs):
         """Increment the affected zones' SOA serials after every record save."""
+        # Empty update_fields is a no-op per Django's contract — pass straight through.
+        if kwargs.get("update_fields") is not None and not kwargs["update_fields"]:
+            super().save(*args, **kwargs)
+            return
+
         if not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
             super().save(*args, **kwargs)
             return
 
-        previous_zone_id = None
-        if not self._state.adding:
-            previous_zone_id = type(self).objects.filter(pk=self.pk).values_list("zone_id", flat=True).first()
-
+        is_update = not self._state.adding
         with transaction.atomic():
+            # Lock and re-read to get the definitive zone_id at the time of this transaction,
+            # guarding against a concurrent zone change on the record.
+            previous_zone_id = (
+                type(self).objects.select_for_update().values_list("zone_id", flat=True).get(pk=self.pk)
+                if is_update
+                else None
+            )
             super().save(*args, **kwargs)
             if previous_zone_id is not None and previous_zone_id != self.zone_id:
                 DNSZone.objects.get(pk=previous_zone_id).increment_soa_serial()

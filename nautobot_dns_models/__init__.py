@@ -101,5 +101,13 @@ class NautobotDnsModelsConfig(NautobotAppConfig):
         ),
     }
 
+    def ready(self):
+        """Connect signal receivers once the app registry is populated."""
+        super().ready()
+
+        from nautobot_dns_models.signals import connect_dns_record_signals  # pylint: disable=import-outside-toplevel
+
+        connect_dns_record_signals()
+
 
 config = NautobotDnsModelsConfig  # pylint:disable=invalid-name

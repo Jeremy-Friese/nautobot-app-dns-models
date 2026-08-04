@@ -1,15 +1,24 @@
 """Tests for SOA serial auto-increment."""
 
+# These tests deliberately inspect DNSZone._initial_soa_serial, the private snapshot that
+# clean() validates against; there is no public accessor for it by design.
+# pylint: disable=protected-access,too-many-lines
+
+import threading
+from unittest import skipUnless
+
 from constance.test import override_config
+from django.core.exceptions import ValidationError
 from django.db import connection, transaction
-from django.test import TransactionTestCase
+from django.db.models.signals import pre_delete
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
-from nautobot.apps.testing import APIViewTestCases, TestCase
+from nautobot.apps.testing import APIViewTestCases, TestCase, TransactionTestCase
 from nautobot.extras.models import Status
 from nautobot.ipam.models import IPAddress, Namespace, Prefix
 from rest_framework import status as http_status
 
-from nautobot_dns_models.forms import DNSZoneForm
+from nautobot_dns_models.forms import DNSZoneForm, TXTRecordForm
 from nautobot_dns_models.models import (
     UINT32_MAX,
     AAAARecord,
@@ -22,15 +31,20 @@ from nautobot_dns_models.models import (
     SRVRecord,
     TXTRecord,
 )
+from nautobot_dns_models.signals import _get_pending_delete_state
 
 
 def _reset_dirty_zones_for_testing():
-    """Clear the connection-bound dedup state between tests."""
+    """Clear serial dedup state and assert delete-batch state has not leaked."""
     conn = connection
     try:
         delattr(conn, "_dns_dirty_zones")
     except AttributeError:
         pass
+
+    pending_state = _get_pending_delete_state(create=False)
+    if pending_state is not None and pending_state["payload"]:
+        raise AssertionError(f"pending delete zone IDs leaked across test boundary: {pending_state['payload']}")
 
 
 def _refresh_serial(zone):
@@ -462,6 +476,142 @@ class SOASerialZoneFieldTestCase(TestCase):
         self.assertEqual(_refresh_serial(other), 100)
 
 
+# ── deferred-field snapshot tests ──────────────────────────────────────────────
+
+
+@override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
+class SOASerialDeferredFieldTestCase(TestCase):
+    """Test _initial_soa_serial capture under deferred loads and partial refreshes.
+
+    ``DNSZone.from_db()`` must not touch ``soa_serial`` when it was not selected: doing so
+    fires one extra query per instance and removes the field from Django's deferred set,
+    which makes a later partial ``refresh_from_db(fields=[...])`` overwrite the caller's
+    in-memory value.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        """Create a zone with a known non-default serial."""
+        cls.zone = _create_zone("deferred.example", serial=42)
+
+    def setUp(self):
+        """Reset serial and dedup state."""
+        DNSZone.objects.filter(pk=self.zone.pk).update(soa_serial=42)
+        _reset_dirty_zones_for_testing()
+
+    def test_only_leaves_serial_deferred(self):
+        """.only() must not trigger a deferred load of soa_serial inside from_db()."""
+        zone = DNSZone.objects.only("name").get(pk=self.zone.pk)
+        self.assertIn("soa_serial", zone.get_deferred_fields(), "from_db() must not load a deferred soa_serial")
+        self.assertIsNone(zone._initial_soa_serial, "an unloaded serial must snapshot as None")
+
+    def test_defer_leaves_serial_deferred(self):
+        """.defer('soa_serial') must not trigger a deferred load inside from_db()."""
+        zone = DNSZone.objects.defer("soa_serial").get(pk=self.zone.pk)
+        self.assertIn("soa_serial", zone.get_deferred_fields())
+        self.assertIsNone(zone._initial_soa_serial)
+
+    def test_deferred_queryset_does_not_issue_n_plus_one(self):
+        """A deferred queryset must not cost one extra query per row.
+
+        Asserted as "cost does not grow with row count" rather than an absolute number, so the
+        test stays valid regardless of any fixed per-test query overhead.
+        """
+        one = DNSZone.objects.filter(pk=self.zone.pk)
+        with CaptureQueriesContext(connection) as single:
+            self.assertEqual(len(list(one.defer("soa_serial"))), 1)
+
+        extra_pks = [_create_zone(f"deferred-n{i}.example", serial=10 + i).pk for i in range(4)]
+        many = DNSZone.objects.filter(pk__in=[self.zone.pk, *extra_pks])
+        with CaptureQueriesContext(connection) as multi:
+            self.assertEqual(len(list(many.defer("soa_serial"))), 5)
+
+        self.assertEqual(
+            len(multi.captured_queries),
+            len(single.captured_queries),
+            "deferred iteration must not scale with row count (N+1 in DNSZone.from_db)",
+        )
+
+    def test_deferred_access_restores_snapshot(self):
+        """Reading a deferred soa_serial must populate the snapshot so clean() still validates."""
+        zone = DNSZone.objects.defer("soa_serial").get(pk=self.zone.pk)
+        self.assertIsNone(zone._initial_soa_serial)
+        self.assertEqual(zone.soa_serial, 42, "deferred read loads the real value")
+        self.assertEqual(zone._initial_soa_serial, 42, "deferred read must restore the snapshot")
+
+        zone.soa_serial = 999
+        with self.assertRaises(ValidationError):
+            zone.clean()
+
+    def test_deferred_direct_assignment_is_rejected(self):
+        """Assigning a deferred serial must still compare against the persisted DB value."""
+        zone = DNSZone.objects.only("name").get(pk=self.zone.pk)
+        self.assertIn("soa_serial", zone.get_deferred_fields())
+
+        zone.soa_serial = 999
+        self.assertNotIn("soa_serial", zone.get_deferred_fields())
+        with self.assertRaises(ValidationError):
+            zone.full_clean()
+
+    def test_clean_with_unloaded_deferred_serial_does_not_force_load(self):
+        """clean() must not load soa_serial merely because it remains deferred and unchanged."""
+        zone = DNSZone.objects.only("name").get(pk=self.zone.pk)
+
+        zone.clean()
+
+        self.assertIn("soa_serial", zone.get_deferred_fields())
+        self.assertIsNone(zone._initial_soa_serial)
+
+    def test_partial_refresh_excluding_serial_preserves_in_memory_value(self):
+        """refresh_from_db(fields=[...]) must not touch soa_serial when it was not requested."""
+        zone = DNSZone.objects.get(pk=self.zone.pk)
+        zone.soa_serial = 999
+        zone.refresh_from_db(fields=["name"])
+        self.assertEqual(zone.soa_serial, 999, "partial refresh must not clobber an excluded field")
+        self.assertEqual(zone._initial_soa_serial, 42, "snapshot must still reflect the DB-loaded value")
+
+        with self.assertRaises(ValidationError):
+            zone.clean()
+
+    def test_partial_refresh_including_serial_updates_snapshot(self):
+        """refresh_from_db(fields=['soa_serial']) must re-snapshot the refreshed value."""
+        zone = DNSZone.objects.get(pk=self.zone.pk)
+        DNSZone.objects.filter(pk=zone.pk).update(soa_serial=77)
+        zone.refresh_from_db(fields=["soa_serial"])
+        self.assertEqual(zone.soa_serial, 77)
+        self.assertEqual(zone._initial_soa_serial, 77)
+        zone.clean()  # must not raise: the value matches what was loaded
+
+    def test_full_refresh_updates_snapshot(self):
+        """A full refresh_from_db() must re-snapshot, discarding an unsaved manual edit."""
+        zone = DNSZone.objects.get(pk=self.zone.pk)
+        zone.soa_serial = 999
+        zone.refresh_from_db()
+        self.assertEqual(zone.soa_serial, 42)
+        self.assertEqual(zone._initial_soa_serial, 42)
+        zone.clean()  # must not raise
+
+    def test_generator_refresh_fields_are_normalized(self):
+        """A generator passed as fields= must not be consumed before the membership check."""
+        zone = DNSZone.objects.get(pk=self.zone.pk)
+        DNSZone.objects.filter(pk=zone.pk).update(soa_serial=88)
+        zone.refresh_from_db(fields=(f for f in ["soa_serial"]))
+        self.assertEqual(zone._initial_soa_serial, 88, "generator fields must still be inspected")
+
+        other = DNSZone.objects.get(pk=self.zone.pk)
+        other.soa_serial = 999
+        other.refresh_from_db(fields=(f for f in ["name"]))
+        self.assertEqual(other.soa_serial, 999, "generator fields excluding serial must not clobber it")
+
+    def test_manual_serial_change_still_rejected_after_full_load(self):
+        """The ordinary (non-deferred) rejection path must be unaffected by the guard."""
+        zone = DNSZone.objects.get(pk=self.zone.pk)
+        self.assertEqual(zone._initial_soa_serial, 42)
+        zone.soa_serial = 43
+        with self.assertRaises(ValidationError):
+            zone.clean()
+
+
 # ── coalescing tests ───────────────────────────────────────────────────────────
 
 
@@ -517,6 +667,255 @@ class SOASerialBulkCoalescingTestCase(TestCase):
             _reset_dirty_zones_for_testing()
         self.assertEqual(_refresh_serial(self.zone), 1)
         self.assertEqual(_refresh_serial(zone2), 1)
+
+
+# ── record mutation policy ─────────────────────────────────────────────────────
+
+
+@override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
+class SOASerialRecordMutationTestCase(TestCase):
+    """Test that any persisted DNS record modification bumps the serial."""
+
+    @classmethod
+    def setUpTestData(cls):
+        """Create shared zone for metadata tests."""
+        cls.zone = _create_zone("record-metadata.example")
+
+    def setUp(self):
+        """Create a record, then reset serial and dedup state before each test."""
+        self.record = TXTRecord.objects.create(name="meta", text="payload", zone=self.zone)
+        DNSZone.objects.filter(pk=self.zone.pk).update(soa_serial=100)
+        self.zone.refresh_from_db()
+        _reset_dirty_zones_for_testing()
+
+    def _form_data(self, **overrides):
+        """Return a valid TXTRecordForm payload for the shared record."""
+        data = {
+            "name": self.record.name,
+            "text": self.record.text,
+            "ttl": self.record._ttl or self.zone.ttl,
+            "zone": self.zone,
+            "description": self.record.description,
+            "comment": self.record.comment,
+        }
+        data.update(overrides)
+        return data
+
+    def test_description_only_update_increments(self):
+        """A description-only save is still a persisted record modification."""
+        self.record.description = "internal note"
+        self.record.save(update_fields=["description"])
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_comment_only_update_increments(self):
+        """A comment-only save is still a persisted record modification."""
+        self.record.comment = "ticket JIRA-1234"
+        self.record.save(update_fields=["comment"])
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_description_and_comment_together_increment_once(self):
+        """A save touching both record note fields increments once."""
+        self.record.description = "note"
+        self.record.comment = "ticket"
+        self.record.save(update_fields=["description", "comment"])
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_generator_update_fields_is_normalized_and_increments(self):
+        """A generator update_fields is normalized before saving and incrementing."""
+        self.record.comment = "generated"
+        self.record.save(update_fields=(field for field in ["comment"]))
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_metadata_alongside_served_field_increments(self):
+        """Record note fields mixed with served data still increment once."""
+        self.record.comment = "ticket"
+        self.record.text = "changed"
+        self.record.save(update_fields=["comment", "text"])
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_served_field_only_update_increments(self):
+        """A served-data change still increments."""
+        self.record.text = "changed"
+        self.record.save(update_fields=["text"])
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_ttl_update_increments(self):
+        """TTL is served zone data and must increment."""
+        self.record._ttl = 900
+        self.record.save(update_fields=["_ttl"])
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_bare_save_still_increments(self):
+        """A save without update_fields always increments.
+
+        No-op detection is deliberately not implemented: it would require snapshotting
+        every served field at load time across every record subclass.
+        """
+        self.record.save()
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_modelform_description_and_comment_update_increments(self):
+        """The normal UI ModelForm path saves without update_fields and increments."""
+        form = TXTRecordForm(
+            data=self._form_data(description="form note", comment="form ticket"),
+            instance=self.record,
+        )
+        self.assertTrue(form.is_valid(), f"form must be valid: {form.errors}")
+        form.save()
+
+        self.assertEqual(_refresh_serial(self.zone), 101)
+
+    def test_zone_move_with_metadata_still_increments_both_zones(self):
+        """zone is served data, so a move increments even when bundled with metadata."""
+        target = _create_zone("record-metadata-target.example")
+        DNSZone.objects.filter(pk=target.pk).update(soa_serial=200)
+        target.refresh_from_db()
+        _reset_dirty_zones_for_testing()
+
+        self.record.zone = target
+        self.record.comment = "moved"
+        self.record.save(update_fields=["zone", "comment"])
+
+        self.assertEqual(_refresh_serial(self.zone), 101)
+        self.assertEqual(_refresh_serial(target), 201)
+
+
+# ── bulk delete via QuerySet.delete() ──────────────────────────────────────────
+
+
+@override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
+class SOASerialBulkDeleteTestCase(TestCase):
+    """Test that QuerySet.delete() increments the serial.
+
+    QuerySet.delete() never calls Model.delete(), and it is the path the Nautobot
+    bulk-delete views take, so these cover the "Delete Selected" UI action.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        """Create shared zone and IP fixtures for bulk delete tests."""
+        cls.zone = _create_zone("bulk-delete.example")
+        status = Status.objects.get(name="Active")
+        namespace = Namespace.objects.get(name="Global")
+        Prefix.objects.create(prefix="10.54.0.0/24", namespace=namespace, type="Pool", status=status)
+        cls.ipv4 = IPAddress.objects.create(address="10.54.0.1/32", namespace=namespace, status=status)
+
+    def _reset_serial(self, *zones):
+        """Pin the given zones to serial 600 and clear dedup state."""
+        pks = [zone.pk for zone in zones] or [self.zone.pk]
+        DNSZone.objects.filter(pk__in=pks).update(soa_serial=600)
+        for zone in zones or (self.zone,):
+            zone.refresh_from_db()
+        _reset_dirty_zones_for_testing()
+
+    def setUp(self):
+        """Reset serial and dedup state before each test."""
+        self._reset_serial()
+
+    def test_queryset_delete_increments_serial(self):
+        """QuerySet.delete() must increment; this is the reported bulk-delete gap."""
+        TXTRecord.objects.create(name="qs-del", text="x", zone=self.zone)
+        self._reset_serial()
+
+        TXTRecord.objects.filter(name="qs-del").delete()
+
+        self.assertEqual(_refresh_serial(self.zone), 601)
+
+    def test_queryset_delete_of_many_coalesces_to_one_increment(self):
+        """Deleting several records in one operation coalesces to a single bump."""
+        for index in range(5):
+            TXTRecord.objects.create(name=f"qs-multi-{index}", text="x", zone=self.zone)
+        self._reset_serial()
+
+        TXTRecord.objects.filter(name__startswith="qs-multi-").delete()
+
+        self.assertEqual(_refresh_serial(self.zone), 601)
+
+    def test_model_delete_increments_exactly_once(self):
+        """Regression guard: the receiver must not double-increment with Model.delete()."""
+        record = TXTRecord.objects.create(name="single-del", text="x", zone=self.zone)
+        self._reset_serial()
+
+        record.delete()
+
+        self.assertEqual(_refresh_serial(self.zone), 601)
+
+    def test_queryset_delete_across_zones_increments_each(self):
+        """A bulk delete spanning two zones increments both."""
+        zone2 = _create_zone("bulk-delete-2.example")
+        TXTRecord.objects.create(name="span-1", text="x", zone=self.zone)
+        TXTRecord.objects.create(name="span-2", text="x", zone=zone2)
+        self._reset_serial(self.zone, zone2)
+
+        TXTRecord.objects.filter(name__in=["span-1", "span-2"]).delete()
+
+        self.assertEqual(_refresh_serial(self.zone), 601)
+        self.assertEqual(_refresh_serial(zone2), 601)
+
+    def test_queryset_delete_does_not_increment_when_disabled(self):
+        """With auto-increment disabled the serial is untouched."""
+        TXTRecord.objects.create(name="qs-off", text="x", zone=self.zone)
+        self._reset_serial()
+
+        with override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=False):
+            TXTRecord.objects.filter(name="qs-off").delete()
+
+        self.assertEqual(_refresh_serial(self.zone), 600)
+
+    def test_cascade_delete_increments_serial(self):
+        """A record removed by cascade from its IP address still increments."""
+        ARecord.objects.create(name="cascade-a", ip_address=self.ipv4, zone=self.zone)
+        self._reset_serial()
+
+        self.ipv4.delete()
+
+        self.assertEqual(_refresh_serial(self.zone), 601)
+
+
+# ── failed delete cleanup (TransactionTestCase) ───────────────────────────────
+
+
+@override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
+class SOASerialFailedDeleteCleanupTestCase(TransactionTestCase):
+    """A rolled-back delete batch must not leak captured zone IDs to the next delete."""
+
+    abort_dispatch_uid = "nautobot_dns_models.tests.abort_txt_delete_after_capture"
+
+    def setUp(self):
+        """Create two zones and clear dedup state."""
+        _reset_dirty_zones_for_testing()
+        self.zone_a = _create_zone("failed-delete-a.example")
+        self.zone_b = _create_zone("failed-delete-b.example")
+
+    def tearDown(self):
+        """Disconnect the test receiver and verify pending delete state did not leak."""
+        pre_delete.disconnect(sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+        _reset_dirty_zones_for_testing()
+
+    def test_failed_delete_does_not_increment_stale_zone_on_next_delete(self):
+        """A failed delete of zone A's record must not make zone A increment on zone B's delete."""
+        record_a = TXTRecord.objects.create(name="failed-delete-a", text="a", zone=self.zone_a)
+        record_b = TXTRecord.objects.create(name="failed-delete-b", text="b", zone=self.zone_b)
+        DNSZone.objects.filter(pk__in=[self.zone_a.pk, self.zone_b.pk]).update(soa_serial=100)
+        _reset_dirty_zones_for_testing()
+
+        def _abort_after_capture(sender, instance, **kwargs):  # pylint: disable=unused-argument
+            if instance.pk == record_a.pk:
+                raise RuntimeError("abort delete after SOA serial pre_delete capture")
+
+        pre_delete.connect(_abort_after_capture, sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+        with self.assertRaises(RuntimeError):
+            TXTRecord.objects.filter(pk=record_a.pk).delete()
+        pre_delete.disconnect(sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+
+        self.assertTrue(TXTRecord.objects.filter(pk=record_a.pk).exists(), "failed delete must roll back")
+        self.assertEqual(_refresh_serial(self.zone_a), 100)
+        self.assertEqual(_refresh_serial(self.zone_b), 100)
+
+        TXTRecord.objects.filter(pk=record_b.pk).delete()
+
+        self.assertEqual(_refresh_serial(self.zone_a), 100, "stale zone A capture must not be consumed")
+        self.assertEqual(_refresh_serial(self.zone_b), 101, "zone B delete must still increment")
 
 
 # ── rollover test ──────────────────────────────────────────────────────────────
@@ -648,6 +1047,156 @@ class SOASerialNestedSavepointTestCase(TransactionTestCase):
         self.assertTrue(TXTRecord.objects.filter(name="sp-b-committed").exists(), "committed record must persist")
 
 
+# ── concurrency tests (PostgreSQL only) ───────────────────────────────────────
+
+
+def _run_concurrently(*fns):
+    """Run each callable in its own thread on its own DB connection; re-raise the first failure.
+
+    Each thread closes its connection on exit so the test runner does not inherit it.
+    """
+    errors = []
+    barrier = threading.Barrier(len(fns))
+
+    def _wrap(fn):
+        def _inner():
+            try:
+                barrier.wait(timeout=10)  # maximise overlap: no thread proceeds until all are ready
+                fn()
+            # Deliberately broad: any thread failure is captured and re-raised on the main thread.
+            except Exception as exc:  # pylint: disable=broad-exception-caught
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        return _inner
+
+    threads = [threading.Thread(target=_wrap(fn)) for fn in fns]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    for thread in threads:
+        if thread.is_alive():
+            raise AssertionError("concurrent thread did not finish within 30s (possible deadlock)")
+    if errors:
+        raise errors[0]
+
+
+@skipUnless(connection.vendor == "postgresql", "row-level locking semantics require PostgreSQL")
+@override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
+class SOASerialConcurrencyTestCase(TransactionTestCase):
+    """Verify select_for_update() prevents lost serial updates under real concurrency.
+
+    SQLite cannot express row-level locking, so these are skipped outside PostgreSQL rather
+    than run and silently pass. Requires TransactionTestCase: each thread needs a real
+    committed transaction, which TestCase's wrapping atomic would prevent.
+    """
+
+    def setUp(self):
+        """Create two zones and clear dedup state."""
+        _reset_dirty_zones_for_testing()
+        self.zone_a = _create_zone("concurrent-a.example")
+        self.zone_b = _create_zone("concurrent-b.example")
+
+    def tearDown(self):
+        """Clear dedup state after each test."""
+        _reset_dirty_zones_for_testing()
+
+    def test_concurrent_record_creates_do_not_lose_updates(self):
+        """Two transactions adding records to one zone must produce exactly two increments."""
+
+        def _add(name):
+            def _fn():
+                with transaction.atomic():
+                    TXTRecord.objects.create(name=name, text=name, zone=self.zone_a)
+
+            return _fn
+
+        _run_concurrently(_add("concurrent-1"), _add("concurrent-2"))
+
+        self.zone_a.refresh_from_db()
+        self.assertEqual(
+            self.zone_a.soa_serial,
+            2,
+            "both committed transactions must be reflected — a lost update means select_for_update() is not holding",
+        )
+
+    def test_opposing_record_moves_do_not_deadlock(self):
+        """Records moving between two zones in opposite directions must not deadlock.
+
+        Both directions touch zone_a and zone_b, so a naive lock order would let the two
+        transactions each hold what the other needs.
+        """
+        rec_a = TXTRecord.objects.create(name="mover-a", text="a", zone=self.zone_a)
+        rec_b = TXTRecord.objects.create(name="mover-b", text="b", zone=self.zone_b)
+        DNSZone.objects.filter(pk__in=[self.zone_a.pk, self.zone_b.pk]).update(soa_serial=0)
+        _reset_dirty_zones_for_testing()
+
+        def _move(record, target_zone):
+            def _fn():
+                with transaction.atomic():
+                    record.zone = target_zone
+                    record.save()
+
+            return _fn
+
+        # Raises AssertionError on timeout rather than hanging the suite.
+        _run_concurrently(_move(rec_a, self.zone_b), _move(rec_b, self.zone_a))
+
+        self.zone_a.refresh_from_db()
+        self.zone_b.refresh_from_db()
+        # Each move increments both the old and the new zone, so each zone is touched twice.
+        self.assertEqual(self.zone_a.soa_serial, 2, "zone A must record both the departure and the arrival")
+        self.assertEqual(self.zone_b.soa_serial, 2, "zone B must record both the departure and the arrival")
+
+    def test_concurrent_zone_update_and_record_create(self):
+        """A watched zone-field update racing a record create must yield two increments."""
+
+        def _update_zone():
+            with transaction.atomic():
+                zone = DNSZone.objects.get(pk=self.zone_a.pk)
+                zone.soa_retry = 3600
+                zone.save()
+
+        def _add_record():
+            with transaction.atomic():
+                TXTRecord.objects.create(name="race-record", text="race", zone=self.zone_a)
+
+        _run_concurrently(_update_zone, _add_record)
+
+        self.zone_a.refresh_from_db()
+        self.assertEqual(
+            self.zone_a.soa_serial,
+            2,
+            "the zone-field change and the record create must each contribute one increment",
+        )
+
+    def test_concurrent_queryset_deletes_across_same_zones_do_not_deadlock(self):
+        """Concurrent bulk-delete transactions touching the same zones in opposite order must finish."""
+        first_a = TXTRecord.objects.create(name="delete-first-a", text="a", zone=self.zone_a)
+        first_b = TXTRecord.objects.create(name="delete-first-b", text="b", zone=self.zone_b)
+        second_b = TXTRecord.objects.create(name="delete-second-b", text="b", zone=self.zone_b)
+        second_a = TXTRecord.objects.create(name="delete-second-a", text="a", zone=self.zone_a)
+        DNSZone.objects.filter(pk__in=[self.zone_a.pk, self.zone_b.pk]).update(soa_serial=0)
+        _reset_dirty_zones_for_testing()
+
+        def _delete_ab():
+            with transaction.atomic():
+                TXTRecord.objects.filter(pk__in=[first_a.pk, first_b.pk]).delete()
+
+        def _delete_ba():
+            with transaction.atomic():
+                TXTRecord.objects.filter(pk__in=[second_b.pk, second_a.pk]).delete()
+
+        _run_concurrently(_delete_ab, _delete_ba)
+
+        self.zone_a.refresh_from_db()
+        self.zone_b.refresh_from_db()
+        self.assertEqual(self.zone_a.soa_serial, 2)
+        self.assertEqual(self.zone_b.soa_serial, 2)
+
+
 # ── REST API serial increment tests ───────────────────────────────────────────
 
 
@@ -705,6 +1254,27 @@ class SOASerialAPITestCase(APIViewTestCases.APIViewTestCase):
 
         url = reverse("plugins-api:nautobot_dns_models-api:txtrecord-detail", kwargs={"pk": record.pk})
         response = self.client.patch(url, data={"text": "after"}, format="json", **self.header)
+        self.assertHttpStatus(response, http_status.HTTP_200_OK)
+        self.assertEqual(_refresh_serial(self.api_zone), 1)
+
+    def test_api_patch_description_and_comment_increments_serial(self):
+        """PATCHing record note fields through DRF still increments because serializers call save()."""
+        self.add_permissions(
+            "nautobot_dns_models.view_txtrecord",
+            "nautobot_dns_models.change_txtrecord",
+            "nautobot_dns_models.view_dnszone",
+        )
+        record = TXTRecord.objects.create(name="api-note", text="before", zone=self.api_zone)
+        _reset_dirty_zones_for_testing()
+        DNSZone.objects.filter(pk=self.api_zone.pk).update(soa_serial=0)
+
+        url = reverse("plugins-api:nautobot_dns_models-api:txtrecord-detail", kwargs={"pk": record.pk})
+        response = self.client.patch(
+            url,
+            data={"description": "API note", "comment": "API ticket"},
+            format="json",
+            **self.header,
+        )
         self.assertHttpStatus(response, http_status.HTTP_200_OK)
         self.assertEqual(_refresh_serial(self.api_zone), 1)
 

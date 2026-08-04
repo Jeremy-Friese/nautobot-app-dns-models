@@ -10,6 +10,11 @@ from nautobot.extras.models import StatusField
 from nautobot.ipam.choices import IPAddressVersionChoices
 from netutils.ip import ipaddress_address
 
+from nautobot_dns_models.utils import get_transaction_scoped_state
+
+# Connection attribute holding the per-transaction serial-increment dedup state.
+DIRTY_ZONES_ATTR = "_dns_dirty_zones"
+
 # Reverse-DNS roots per RFC 1035 §3.5 and RFC 3596 §2.5
 RESERVED_ROOTS = {"in-addr.arpa", "ip6.arpa", "arpa"}
 
@@ -19,48 +24,19 @@ RESERVED_ROOTS = {"in-addr.arpa", "ip6.arpa", "arpa"}
 # RFC 1982 §7 specifies SERIAL's uint32 range and arithmetic.
 UINT32_MAX = 2**32 - 1
 
+# RFC 2136 §7.11: "A zone's SOA SERIAL should never be set to zero (0) due to interoperability
+# problems with some older but widely installed implementations of DNS."
+SOA_SERIAL_ZERO_MESSAGE = "RFC 2136 §7.11: a zone's SOA serial should not be set to 0. Use 1 or greater."
+
 
 def _get_dirty_zones():
     """Return the per-transaction dict mapping zone PK to last-incremented serial.
 
-    State is connection-bound (not thread-local) and cleared via an on_commit hook,
-    so transaction commits and rollbacks do not leak dedup state across requests.
+    Coalesces repeated increments of the same zone within one transaction.  The state is
+    transaction-scoped so a commit or a rollback cannot leak dedup entries into the next
+    request on the same connection.
     """
-    conn = transaction.get_connection()
-    state = getattr(conn, "_dns_dirty_zones", None)
-
-    # ``conn.run_on_commit`` is a Django-internal list of (savepoint_ids, func, robust)
-    # tuples (Django 4.2).  When the outer atomic ends, our hook is absent from the list
-    # (committed: called and drained; rolled back: dropped).  Treat absent as stale.
-    if state is not None and not any(entry[1] is state["hook"] for entry in conn.run_on_commit):
-        try:
-            delattr(conn, "_dns_dirty_zones")
-        except AttributeError:
-            pass
-        state = None
-
-    if state is None:
-        zones = {}
-
-        def _clear():
-            current = getattr(conn, "_dns_dirty_zones", None)
-            if current is not None and current["hook"] is _clear:
-                try:
-                    delattr(conn, "_dns_dirty_zones")
-                except AttributeError:
-                    pass
-
-        try:
-            transaction.on_commit(_clear)
-        except transaction.TransactionManagementError:
-            # No outer atomic to register against; coalescing is moot in
-            # autocommit mode (each save fires exactly one increment).
-            pass
-
-        state = {"zones": zones, "hook": _clear}
-        setattr(conn, "_dns_dirty_zones", state)
-
-    return state["zones"]
+    return get_transaction_scoped_state(DIRTY_ZONES_ATTR, dict)["payload"]
 
 
 def dns_wire_label_length(label):
@@ -251,17 +227,42 @@ def get_default_view_pk():
 class DNSZone(DNSModel):
     """Model for DNS SOA Records. An SOA Record defines a DNS Zone."""
 
+    # Serial as loaded from the database, used by clean() to detect intentional changes.
+    # Declared here so every instance has it without a getattr() default; ``None`` means
+    # "not loaded from the database" (unsaved instance, or a deferred serial never accessed).
+    _initial_soa_serial = None
+
     @classmethod
     def from_db(cls, db, field_names, values):
-        """Capture the DB-loaded serial so clean() can detect intentional changes."""
+        """Capture the DB-loaded serial so clean() can detect intentional changes.
+
+        Snapshot only when ``soa_serial`` was selected.  Touching a deferred ``soa_serial`` here
+        costs a query per instance (an N+1 on any ``.only()``/``.defer()`` queryset) and makes a
+        later partial ``refresh_from_db(fields=[...])`` silently overwrite the caller's in-memory
+        value, since loading it drops the field from Django's deferred set.  ``None`` means "never
+        loaded"; ``clean()`` only fetches a comparison baseline if the field was later assigned or
+        otherwise loaded.
+        """
         instance = super().from_db(db, field_names, values)
-        instance._initial_soa_serial = instance.soa_serial
+        # pylint cannot infer that super().from_db() returns a DNSZone, so it reads the
+        # attribute access below as reaching into an unrelated class.
+        # pylint: disable-next=protected-access,no-member
+        instance._initial_soa_serial = instance.soa_serial if "soa_serial" in field_names else None
         return instance
 
-    def refresh_from_db(self, *args, **kwargs):
-        """Update the captured serial after a DB refresh."""
-        super().refresh_from_db(*args, **kwargs)
-        self._initial_soa_serial = self.soa_serial
+    # ``fields`` is named so it can be inspected; ``*args``/``**kwargs`` forward the rest, since
+    # Django 4.2 takes (using, fields) while 5.1+ adds ``from_queryset``.  Re-snapshotting on a
+    # partial refresh that excluded ``soa_serial`` would capture an unsaved manual edit and so
+    # defeat ``clean()``, hence the membership check below.
+    # pylint: disable=keyword-arg-before-vararg
+    def refresh_from_db(self, using=None, fields=None, *args, **kwargs):
+        """Update the captured serial, but only when ``soa_serial`` was actually refreshed."""
+        # Normalize once: ``fields`` may be any iterable, and super() would consume a generator.
+        if fields is not None:
+            fields = list(fields)
+        super().refresh_from_db(using, fields, *args, **kwargs)
+        if fields is None or "soa_serial" in fields:
+            self._initial_soa_serial = self.soa_serial
 
     name = models.CharField(max_length=200, help_text="FQDN of the Zone, w/ TLD. e.g example.com")
     dns_view = ForeignKeyWithAutoRelatedName(
@@ -306,8 +307,11 @@ class DNSZone(DNSModel):
     )
     soa_serial = models.PositiveBigIntegerField(
         validators=[MaxValueValidator(UINT32_MAX)],
-        default=0,
-        help_text="Serial number of the zone. This value must be incremented each time the zone is changed, and secondary DNS servers must be able to retrieve this value to check if the zone has been updated.",
+        default=1,
+        help_text=(
+            "Serial number of the zone, incremented each time the zone changes so secondary DNS servers can "
+            "detect updates. New zones default to 1; unchanged legacy zones with serial 0 remain editable."
+        ),
         verbose_name="SOA Serial",
     )
     soa_minimum = models.PositiveBigIntegerField(
@@ -435,17 +439,31 @@ class DNSZone(DNSModel):
             if should_increment:
                 self.increment_soa_serial()
 
+    def _get_soa_serial_validation_baseline(self):
+        """Return the DB-loaded serial used for validation, fetching only after deferred assignment."""
+        if self._initial_soa_serial is not None:
+            return self._initial_soa_serial
+        if self.present_in_database and "soa_serial" not in self.get_deferred_fields():
+            self._initial_soa_serial = DNSZone.objects.values_list("soa_serial", flat=True).get(pk=self.pk)
+            return self._initial_soa_serial
+        return None
+
     def clean(self):
         """Reject manual SOA serial changes while automatic incrementing is enabled."""
         super().clean()
+        serial_is_loaded = "soa_serial" not in self.get_deferred_fields()
+        initial = self._get_soa_serial_validation_baseline()
+
+        if serial_is_loaded and self.soa_serial == 0 and (not self.present_in_database or initial != 0):
+            raise ValidationError({"soa_serial": SOA_SERIAL_ZERO_MESSAGE})
+
         if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT and self.present_in_database:
             # Compare against the serial as loaded when this instance was fetched from the database
             # (_initial_soa_serial set by from_db/refresh_from_db), not the current DB value.
             # This validates the user's intent: did they change the serial from what they loaded?
             # Using the current DB value would cause false rejections when a concurrent increment
             # occurs between form render and submission.
-            initial = getattr(self, "_initial_soa_serial", None)
-            if initial is not None and self.soa_serial != initial:
+            if serial_is_loaded and initial is not None and self.soa_serial != initial:
                 raise ValidationError(
                     {
                         "soa_serial": (
@@ -582,7 +600,7 @@ class DNSRecord(DNSModel):
     comment = models.CharField(max_length=200, help_text="Comment for the Record.", blank=True)
 
     def save(self, *args, **kwargs):
-        """Increment the affected zones' SOA serials after every record save."""
+        """Increment the affected zones' SOA serials after every persisted record save."""
         # Normalize update_fields once (consuming any generator) and write back into kwargs.
         raw_update_fields = kwargs.get("update_fields")
         if raw_update_fields is not None:
@@ -607,26 +625,18 @@ class DNSRecord(DNSModel):
                 else None
             )
             super().save(*args, **kwargs)
+
+            # A move touches two zone rows; lock them in a deterministic global order (by PK)
+            # rather than old-then-new, or opposing moves between the same pair deadlock.
+            zones = {self.zone_id: self.zone} if self.zone_id else {}  # pylint: disable=no-member
             if previous_zone_id is not None and previous_zone_id != self.zone_id:
-                DNSZone.objects.get(pk=previous_zone_id).increment_soa_serial()
-            if self.zone_id:
-                self.zone.increment_soa_serial()  # pylint: disable=no-member
+                zones[previous_zone_id] = DNSZone.objects.get(pk=previous_zone_id)
+            for zone_id in sorted(zones, key=str):
+                zones[zone_id].increment_soa_serial()
 
-    def delete(self, *args, **kwargs):
-        """Increment the parent zone's SOA serial after a record is deleted.
-
-        Note: QuerySet.delete() bypasses this method; bulk deletes will not trigger a serial increment.
-        """
-        if not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
-            return super().delete(*args, **kwargs)
-
-        with transaction.atomic():
-            # Lock and re-read to get the definitive zone as of this transaction,
-            # guarding against a concurrent zone change on the record.
-            zone_id = type(self).objects.select_for_update().values_list("zone_id", flat=True).get(pk=self.pk)
-            result = super().delete(*args, **kwargs)
-            DNSZone.objects.get(pk=zone_id).increment_soa_serial()
-        return result
+    # Deletion is handled by pre_delete/post_delete receivers in signals.py rather than a
+    # delete() override, so that QuerySet.delete() — which the Nautobot bulk-delete views use —
+    # increments the serial too. Overriding delete() as well would double-increment.
 
     def clean(self):
         """

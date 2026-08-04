@@ -1,0 +1,1 @@
+Changed the default `DNSZone.soa_serial` to 1 and rejected serial 0 on new zones and on changes away from a nonzero serial, per RFC 2136 section 7.11. Existing zones already at serial 0 remain editable and move to 1 on their first automatic increment.

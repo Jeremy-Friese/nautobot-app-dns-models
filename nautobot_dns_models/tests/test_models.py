@@ -823,18 +823,63 @@ class DNSZoneIntegerFieldBoundaryTest(TestCase):
             "soa_refresh": 86400,
             "soa_retry": 7200,
             "soa_expire": 3600000,
-            "soa_serial": 0,
+            "soa_serial": 1,
             "soa_minimum": 3600,
         }
         defaults.update(kwargs)
         return DNSZone(**defaults)
 
     def test_all_fields_accept_zero(self):
-        """All DNS integer zone fields accept 0 as a valid value."""
+        """All DNS integer zone fields accept 0, except soa_serial (RFC 2136 §7.11)."""
         for field in self._INTEGER_FIELDS:
+            if field == "soa_serial":
+                continue  # covered by test_soa_serial_rejects_zero
             with self.subTest(field=field):
                 zone = self._make_zone(name=f"{field}-zero.example", **{field: 0})
                 zone.full_clean()
+
+    def test_soa_serial_rejects_zero(self):
+        """New zones reject serial 0 per RFC 2136 §7.11."""
+        zone = self._make_zone(name="soa-serial-zero.example", soa_serial=0)
+        with self.assertRaises(ValidationError) as ctx:
+            zone.full_clean()
+        self.assertIn("soa_serial", ctx.exception.message_dict)
+
+    def test_existing_legacy_soa_serial_zero_is_valid_when_unchanged(self):
+        """An unchanged legacy zone at serial 0 remains editable."""
+        DNSZone.objects.create(
+            name="legacy-zero.example",
+            filename="legacy-zero.zone",
+            soa_mname="ns1.legacy-zero.example.",
+            soa_rname="admin@legacy-zero.example",
+            soa_serial=0,
+        )
+        zone = DNSZone.objects.get(name="legacy-zero.example")
+        zone.description = "metadata update"
+
+        zone.full_clean()
+
+    def test_existing_soa_serial_cannot_change_from_nonzero_to_zero(self):
+        """Existing zones may not intentionally move a nonzero serial back to 0."""
+        DNSZone.objects.create(
+            name="nonzero-to-zero.example",
+            filename="nonzero-to-zero.zone",
+            soa_mname="ns1.nonzero-to-zero.example.",
+            soa_rname="admin@nonzero-to-zero.example",
+            soa_serial=5,
+        )
+        zone = DNSZone.objects.get(name="nonzero-to-zero.example")
+        zone.soa_serial = 0
+
+        with self.assertRaises(ValidationError) as ctx:
+            zone.full_clean()
+        self.assertIn("soa_serial", ctx.exception.message_dict)
+
+    def test_soa_serial_accepts_one(self):
+        """1 is the lowest valid SOA serial and the model default."""
+        zone = self._make_zone(name="soa-serial-one.example", soa_serial=1)
+        zone.full_clean()
+        self.assertEqual(DNSZone().soa_serial, 1, "new zones must default to 1, not 0")
 
     def test_all_fields_accept_uint32_max(self):
         """All DNS integer zone fields accept the uint32 maximum."""

@@ -68,5 +68,23 @@ RUN if [ -z "${CI+x}" ]; then \
 # Install the app
 RUN poetry install --extras all --with dev
 
+# frisian-mcp (MCP gateway) — exposes the DNS app over MCP (see nautobot_config.py).
+# --no-deps is REQUIRED: frisian-mcp pins `django>=5`, but Nautobot 3.0 runs on
+# Django 4.2, so a normal install would upgrade Django and break Nautobot.
+# Nautobot already provides frisian-mcp's runtime deps (django, DRF, jsonschema).
+# tiktoken enables real cl100k_base token counts (the [usage] feature); without it
+# the counter degrades to an approximation.
+# 1.1.0 (the per-route FRISIAN_MCP_ROUTES model this config uses) is not on PyPI
+# yet — PyPI's latest is 1.0.12 — so install from git `main`. Override the ref at
+# build: docker build --build-arg FRISIAN_MCP_REF=<branch|tag|sha> ...
+ARG FRISIAN_MCP_REF=main
+# Persist the tiktoken BPE cache in the image so the real cl100k_base token
+# counter loads offline at runtime (same as the Nautobot Core setup).
+ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken_cache
+RUN pip install --no-deps "frisian-mcp @ git+https://github.com/Frisian-MCP/frisian-mcp.git@${FRISIAN_MCP_REF}" \
+    && pip install "tiktoken>=0.7,<1" \
+    && mkdir -p "${TIKTOKEN_CACHE_DIR}" \
+    && python -c "import tiktoken; tiktoken.get_encoding('cl100k_base'); print('cl100k_base cached')"
+
 COPY development/nautobot_config.py ${NAUTOBOT_ROOT}/nautobot_config.py
 # !!! USE CAUTION WHEN MODIFYING LINES ABOVE

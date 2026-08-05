@@ -141,11 +141,20 @@ PLUGINS = ["nautobot_dns_models"]
 # ===========================================================================
 
 # frisian-mcp is a plain Django app (not a Nautobot plugin) + its two contribs.
-EXTRA_INSTALLED_APPS = [
-    "frisian_mcp",
-    "frisian_mcp.contrib.oauth",
-    "frisian_mcp.contrib.tokens",
-]
+# Guarded on import: the dev containers install frisian-mcp via the entrypoint
+# wrapper (development/docker-entrypoint.frisian-mcp.sh), so this activates. The
+# "final"/CI containers do NOT run that wrapper, so without the guard they would
+# crash loading a missing app — instead they simply run without the MCP surface.
+try:
+    import frisian_mcp  # noqa: F401  (installed check only)
+
+    EXTRA_INSTALLED_APPS = [
+        "frisian_mcp",
+        "frisian_mcp.contrib.oauth",
+        "frisian_mcp.contrib.tokens",
+    ]
+except ImportError:
+    EXTRA_INSTALLED_APPS = []
 
 # --- Routes: two authenticated tiers, no open-world/guest door --------------
 _DNS_ALLOW = ["dns"]  # only the DNS dispatch group is exposed

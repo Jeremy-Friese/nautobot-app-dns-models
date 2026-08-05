@@ -5,19 +5,24 @@
 ---
 services:
   nautobot:
-    # Editable-install frisian-mcp (from the bind-mounted source) before starting
-    # the server. `[usage]` is single-quoted so the shell does not glob it.
+    # frisian-mcp is installed by the entrypoint wrapper (before the base image's
+    # /docker-entrypoint.sh runs post_upgrade/check, which import frisian_mcp).
+    entrypoint:
+      - "bash"
+      - "/docker-entrypoint.frisian-mcp.sh"
     command:
-      - "sh"
-      - "-c"
-      - "pip install -q --no-build-isolation -e '/opt/frisian-mcp[usage]' || pip install -q --no-build-isolation -e /opt/frisian-mcp && exec nautobot-server runserver 0.0.0.0:8080"
+      - "/docker-entrypoint.sh"
+      - "nautobot-server"
+      - "runserver"
+      - "0.0.0.0:8080"
     ports:
       - "8080:8080"
     volumes:
       - "./nautobot_config.py:/opt/nautobot/nautobot_config.py"
       - "../:/source"
-      # frisian-mcp source (editable-installed at container start; see command/entrypoint)
+      # frisian-mcp source (editable-installed by the entrypoint wrapper below)
       - "${FRISIAN_MCP_SRC:-../../../MPC_development/frisian-mcp}:/opt/frisian-mcp"
+      - "./docker-entrypoint.frisian-mcp.sh:/docker-entrypoint.frisian-mcp.sh"
     healthcheck:
       interval: "30s"
       timeout: "10s"
@@ -38,27 +43,34 @@ services:
       disable: true
     tty: true
   worker:
+    # Install frisian-mcp (entrypoint), then run the original watchmedo command.
     entrypoint:
+      - "bash"
+      - "/docker-entrypoint.frisian-mcp.sh"
+    command:
       - "sh"
       - "-c"  # this is to evaluate the $NAUTOBOT_LOG_LEVEL from the env
-      - "pip install -q --no-build-isolation -e '/opt/frisian-mcp[usage]' || pip install -q --no-build-isolation -e /opt/frisian-mcp && exec watchmedo auto-restart --directory './' --pattern '*.py' --recursive -- nautobot-server celery worker -l $$NAUTOBOT_LOG_LEVEL --events"  ## $$ because of docker-compose
+      - "watchmedo auto-restart --directory './' --pattern '*.py' --recursive -- nautobot-server celery worker -l $$NAUTOBOT_LOG_LEVEL --events"  ## $$ because of docker-compose
     volumes:
       - "./nautobot_config.py:/opt/nautobot/nautobot_config.py"
       - "../:/source"
-      # frisian-mcp source (editable-installed at container start; see command/entrypoint)
       - "${FRISIAN_MCP_SRC:-../../../MPC_development/frisian-mcp}:/opt/frisian-mcp"
+      - "./docker-entrypoint.frisian-mcp.sh:/docker-entrypoint.frisian-mcp.sh"
     healthcheck:
       test: ["CMD", "true"]  # Due to layering, disable: true won't work. Instead, change the test
   beat:
     entrypoint:
+      - "bash"
+      - "/docker-entrypoint.frisian-mcp.sh"
+    command:
       - "sh"
       - "-c"  # this is to evaluate the $NAUTOBOT_BEAT_LOG_LEVEL from the env
-      - "pip install -q --no-build-isolation -e '/opt/frisian-mcp[usage]' || pip install -q --no-build-isolation -e /opt/frisian-mcp && exec watchmedo auto-restart --directory './' --pattern '*.py' --recursive -- nautobot-server celery beat -l $$NAUTOBOT_BEAT_LOG_LEVEL"  ## $$ because of docker-compose
+      - "watchmedo auto-restart --directory './' --pattern '*.py' --recursive -- nautobot-server celery beat -l $$NAUTOBOT_BEAT_LOG_LEVEL"  ## $$ because of docker-compose
     volumes:
       - "./nautobot_config.py:/opt/nautobot/nautobot_config.py"
       - "../:/source"
-      # frisian-mcp source (editable-installed at container start; see command/entrypoint)
       - "${FRISIAN_MCP_SRC:-../../../MPC_development/frisian-mcp}:/opt/frisian-mcp"
+      - "./docker-entrypoint.frisian-mcp.sh:/docker-entrypoint.frisian-mcp.sh"
 # To expose postgres (5432), myql (3306) on db service or redis (6379) to the host uncomment the
 # following. Ensure to match the 2 idented spaces which to have the service nested under services.
 # db:

@@ -1,1 +1,3 @@
-Changed the default `DNSZone.soa_serial` to 1 and rejected serial 0 on new zones and on changes away from a nonzero serial, per RFC 2136 section 7.11. Existing zones already at serial 0 remain editable and move to 1 on their first automatic increment.
+New DNS zones now start with a SOA serial of 1.
+Setting a zone's SOA serial to 0 is now rejected, both on new zones and when changing an existing nonzero serial back to 0.
+Zones already stored with a serial of 0 remain editable and advance to 1 on their next automatic serial increment.

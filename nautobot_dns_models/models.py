@@ -394,6 +394,7 @@ class DNSZone(DNSModel):
         # Internal increment call: update_fields == {"soa_serial"} — skip re-entrant increment.
         if update_fields_set == frozenset({"soa_serial"}):
             super().save(*args, **kwargs)
+            self._initial_soa_serial = self.soa_serial
             return
 
         # Empty update_fields is a no-op per Django's contract — pass straight through.
@@ -403,10 +404,14 @@ class DNSZone(DNSModel):
 
         if not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
             super().save(*args, **kwargs)
+            # Synchronize snapshot whenever soa_serial may have been written.
+            if update_fields_set is None or "soa_serial" in update_fields_set:
+                self._initial_soa_serial = self.soa_serial
             return
 
         if not self.present_in_database:
             super().save(*args, **kwargs)
+            self._initial_soa_serial = self.soa_serial
             return
 
         watched_in_update = (
@@ -417,6 +422,9 @@ class DNSZone(DNSModel):
 
         if not watched_in_update:
             super().save(*args, **kwargs)
+            # Synchronize snapshot when soa_serial was explicitly written.
+            if update_fields_set is None or "soa_serial" in update_fields_set:
+                self._initial_soa_serial = self.soa_serial
             return
 
         with transaction.atomic():
@@ -438,6 +446,9 @@ class DNSZone(DNSModel):
 
             if should_increment:
                 self.increment_soa_serial()
+            elif update_fields_set is None or "soa_serial" in update_fields_set:
+                # No increment, but soa_serial was written — keep snapshot in sync.
+                self._initial_soa_serial = self.soa_serial
 
     def _get_soa_serial_validation_baseline(self):
         """Return the DB-loaded serial used for validation, fetching only after deferred assignment."""
@@ -616,9 +627,9 @@ class DNSRecord(DNSModel):
             return
 
         is_update = not self._state.adding
+        update_fields_set = kwargs.get("update_fields")  # already normalized above
         with transaction.atomic():
-            # Lock and re-read to get the definitive zone_id at the time of this transaction,
-            # guarding against a concurrent zone change on the record.
+            # Lock and re-read to get the definitive pre-save zone_id.
             previous_zone_id = (
                 type(self).objects.select_for_update().values_list("zone_id", flat=True).get(pk=self.pk)
                 if is_update
@@ -626,13 +637,26 @@ class DNSRecord(DNSModel):
             )
             super().save(*args, **kwargs)
 
+            # Determine the post-save zone from the database, not from self.zone_id.
+            # When update_fields omits "zone", Django leaves the record in its old zone,
+            # so self.zone_id may differ from what was actually persisted.
+            if update_fields_set is not None and "zone" not in update_fields_set and "zone_id" not in update_fields_set:
+                # zone was not written — authoritative zone is previous_zone_id (or nothing if new).
+                persisted_zone_id = previous_zone_id
+            else:
+                persisted_zone_id = self.zone_id  # pylint: disable=no-member
+
             # A move touches two zone rows; lock them in a deterministic global order (by PK)
             # rather than old-then-new, or opposing moves between the same pair deadlock.
-            zones = {self.zone_id: self.zone} if self.zone_id else {}  # pylint: disable=no-member
-            if previous_zone_id is not None and previous_zone_id != self.zone_id:
-                zones[previous_zone_id] = DNSZone.objects.get(pk=previous_zone_id)
-            for zone_id in sorted(zones, key=str):
-                zones[zone_id].increment_soa_serial()
+            zone_ids_to_bump = set()
+            if persisted_zone_id:
+                zone_ids_to_bump.add(persisted_zone_id)
+            if previous_zone_id is not None and previous_zone_id != persisted_zone_id:
+                zone_ids_to_bump.add(previous_zone_id)
+            for zone_id in sorted(zone_ids_to_bump, key=str):
+                zone = DNSZone.objects.filter(pk=zone_id).first()
+                if zone is not None:
+                    zone.increment_soa_serial()
 
     # Deletion is handled by pre_delete/post_delete receivers in signals.py rather than a
     # delete() override, so that QuerySet.delete() — which the Nautobot bulk-delete views use —

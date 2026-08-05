@@ -1,8 +1,6 @@
 """Tests for SOA serial auto-increment."""
 
-# These tests deliberately inspect DNSZone._initial_soa_serial, the private snapshot that
-# clean() validates against; there is no public accessor for it by design.
-# pylint: disable=protected-access,too-many-lines
+# pylint: disable=too-many-lines
 
 import threading
 from unittest import skipUnless
@@ -31,20 +29,15 @@ from nautobot_dns_models.models import (
     SRVRecord,
     TXTRecord,
 )
-from nautobot_dns_models.signals import _get_pending_delete_state
 
 
 def _reset_dirty_zones_for_testing():
-    """Clear serial dedup state and assert delete-batch state has not leaked."""
+    """Clear the serial dedup state between tests."""
     conn = connection
     try:
         delattr(conn, "_dns_dirty_zones")
     except AttributeError:
         pass
-
-    pending_state = _get_pending_delete_state(create=False)
-    if pending_state is not None and pending_state["payload"]:
-        raise AssertionError(f"pending delete zone IDs leaked across test boundary: {pending_state['payload']}")
 
 
 def _refresh_serial(zone):
@@ -481,12 +474,10 @@ class SOASerialZoneFieldTestCase(TestCase):
 
 @override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
 class SOASerialDeferredFieldTestCase(TestCase):
-    """Test _initial_soa_serial capture under deferred loads and partial refreshes.
+    """Deferred serial fields remain unloaded until accessed without weakening serial validation.
 
-    ``DNSZone.from_db()`` must not touch ``soa_serial`` when it was not selected: doing so
-    fires one extra query per instance and removes the field from Django's deferred set,
-    which makes a later partial ``refresh_from_db(fields=[...])`` overwrite the caller's
-    in-memory value.
+    ``soa_serial`` stays deferred until it is read, deferred iteration does not scale queries
+    with row count, and serial-change rejection still holds.
     """
 
     @classmethod
@@ -500,16 +491,14 @@ class SOASerialDeferredFieldTestCase(TestCase):
         _reset_dirty_zones_for_testing()
 
     def test_only_leaves_serial_deferred(self):
-        """.only() must not trigger a deferred load of soa_serial inside from_db()."""
+        """.only() leaves soa_serial deferred rather than loading it."""
         zone = DNSZone.objects.only("name").get(pk=self.zone.pk)
-        self.assertIn("soa_serial", zone.get_deferred_fields(), "from_db() must not load a deferred soa_serial")
-        self.assertIsNone(zone._initial_soa_serial, "an unloaded serial must snapshot as None")
+        self.assertIn("soa_serial", zone.get_deferred_fields(), "a serial not selected must stay deferred")
 
     def test_defer_leaves_serial_deferred(self):
-        """.defer('soa_serial') must not trigger a deferred load inside from_db()."""
+        """.defer('soa_serial') leaves soa_serial deferred."""
         zone = DNSZone.objects.defer("soa_serial").get(pk=self.zone.pk)
         self.assertIn("soa_serial", zone.get_deferred_fields())
-        self.assertIsNone(zone._initial_soa_serial)
 
     def test_deferred_queryset_does_not_issue_n_plus_one(self):
         """A deferred queryset must not cost one extra query per row.
@@ -529,15 +518,13 @@ class SOASerialDeferredFieldTestCase(TestCase):
         self.assertEqual(
             len(multi.captured_queries),
             len(single.captured_queries),
-            "deferred iteration must not scale with row count (N+1 in DNSZone.from_db)",
+            "deferred iteration must not issue an extra query per row",
         )
 
-    def test_deferred_access_restores_snapshot(self):
-        """Reading a deferred soa_serial must populate the snapshot so clean() still validates."""
+    def test_deferred_read_then_change_is_rejected(self):
+        """Reading a deferred soa_serial then changing it must still be rejected by clean()."""
         zone = DNSZone.objects.defer("soa_serial").get(pk=self.zone.pk)
-        self.assertIsNone(zone._initial_soa_serial)
         self.assertEqual(zone.soa_serial, 42, "deferred read loads the real value")
-        self.assertEqual(zone._initial_soa_serial, 42, "deferred read must restore the snapshot")
 
         zone.soa_serial = 999
         with self.assertRaises(ValidationError):
@@ -557,10 +544,9 @@ class SOASerialDeferredFieldTestCase(TestCase):
         """clean() must not load soa_serial merely because it remains deferred and unchanged."""
         zone = DNSZone.objects.only("name").get(pk=self.zone.pk)
 
-        zone.clean()
+        zone.clean()  # must not raise and must not force-load the field
 
         self.assertIn("soa_serial", zone.get_deferred_fields())
-        self.assertIsNone(zone._initial_soa_serial)
 
     def test_partial_refresh_excluding_serial_preserves_in_memory_value(self):
         """refresh_from_db(fields=[...]) must not touch soa_serial when it was not requested."""
@@ -568,27 +554,25 @@ class SOASerialDeferredFieldTestCase(TestCase):
         zone.soa_serial = 999
         zone.refresh_from_db(fields=["name"])
         self.assertEqual(zone.soa_serial, 999, "partial refresh must not clobber an excluded field")
-        self.assertEqual(zone._initial_soa_serial, 42, "snapshot must still reflect the DB-loaded value")
 
+        # The in-memory 999 still differs from the DB-loaded 42, so clean() must reject it.
         with self.assertRaises(ValidationError):
             zone.clean()
 
-    def test_partial_refresh_including_serial_updates_snapshot(self):
-        """refresh_from_db(fields=['soa_serial']) must re-snapshot the refreshed value."""
+    def test_partial_refresh_including_serial_accepts_refreshed_value(self):
+        """refresh_from_db(fields=['soa_serial']) must accept the refreshed value in clean()."""
         zone = DNSZone.objects.get(pk=self.zone.pk)
         DNSZone.objects.filter(pk=zone.pk).update(soa_serial=77)
         zone.refresh_from_db(fields=["soa_serial"])
         self.assertEqual(zone.soa_serial, 77)
-        self.assertEqual(zone._initial_soa_serial, 77)
-        zone.clean()  # must not raise: the value matches what was loaded
+        zone.clean()  # must not raise: the value matches what was just loaded
 
-    def test_full_refresh_updates_snapshot(self):
-        """A full refresh_from_db() must re-snapshot, discarding an unsaved manual edit."""
+    def test_full_refresh_discards_unsaved_edit(self):
+        """A full refresh_from_db() must reload the DB value so clean() accepts it."""
         zone = DNSZone.objects.get(pk=self.zone.pk)
         zone.soa_serial = 999
         zone.refresh_from_db()
         self.assertEqual(zone.soa_serial, 42)
-        self.assertEqual(zone._initial_soa_serial, 42)
         zone.clean()  # must not raise
 
     def test_generator_refresh_fields_are_normalized(self):
@@ -596,7 +580,8 @@ class SOASerialDeferredFieldTestCase(TestCase):
         zone = DNSZone.objects.get(pk=self.zone.pk)
         DNSZone.objects.filter(pk=zone.pk).update(soa_serial=88)
         zone.refresh_from_db(fields=(f for f in ["soa_serial"]))
-        self.assertEqual(zone._initial_soa_serial, 88, "generator fields must still be inspected")
+        self.assertEqual(zone.soa_serial, 88, "generator fields must still be inspected")
+        zone.clean()  # must not raise: matches the refreshed value
 
         other = DNSZone.objects.get(pk=self.zone.pk)
         other.soa_serial = 999
@@ -604,12 +589,27 @@ class SOASerialDeferredFieldTestCase(TestCase):
         self.assertEqual(other.soa_serial, 999, "generator fields excluding serial must not clobber it")
 
     def test_manual_serial_change_still_rejected_after_full_load(self):
-        """The ordinary (non-deferred) rejection path must be unaffected by the guard."""
+        """A manual serial change remains invalid after a full load."""
         zone = DNSZone.objects.get(pk=self.zone.pk)
-        self.assertEqual(zone._initial_soa_serial, 42)
         zone.soa_serial = 43
         with self.assertRaises(ValidationError):
             zone.clean()
+
+    @override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=False)
+    def test_reused_instance_rejects_serial_reset_to_zero_after_save(self):
+        """A reused instance cannot reset a persisted nonzero serial to zero."""
+        legacy = _create_zone("reuse-legacy-zero.example", serial=0)
+        zone = DNSZone.objects.get(pk=legacy.pk)
+
+        zone.soa_serial = 1
+        zone.validated_save()  # moving away from legacy 0 is allowed
+
+        zone.soa_serial = 0
+        with self.assertRaises(ValidationError):
+            zone.validated_save()
+
+        zone.refresh_from_db()
+        self.assertEqual(zone.soa_serial, 1, "the persisted nonzero serial must be preserved")
 
 
 # ── coalescing tests ───────────────────────────────────────────────────────────
@@ -693,7 +693,7 @@ class SOASerialRecordMutationTestCase(TestCase):
         data = {
             "name": self.record.name,
             "text": self.record.text,
-            "ttl": self.record._ttl or self.zone.ttl,
+            "ttl": self.record.ttl,
             "zone": self.zone,
             "description": self.record.description,
             "comment": self.record.comment,
@@ -741,7 +741,7 @@ class SOASerialRecordMutationTestCase(TestCase):
 
     def test_ttl_update_increments(self):
         """TTL is served zone data and must increment."""
-        self.record._ttl = 900
+        self.record.ttl = 900
         self.record.save(update_fields=["_ttl"])
         self.assertEqual(_refresh_serial(self.zone), 101)
 
@@ -778,6 +778,26 @@ class SOASerialRecordMutationTestCase(TestCase):
 
         self.assertEqual(_refresh_serial(self.zone), 101)
         self.assertEqual(_refresh_serial(target), 201)
+
+    def test_unpersisted_zone_assignment_only_increments_the_persisted_zone(self):
+        """Assigning a new zone but omitting it from update_fields leaves the record in place.
+
+        Django does not persist the reassignment, so only the original zone — the one that was
+        actually written — may increment; the unpersisted target must not.
+        """
+        target = _create_zone("record-metadata-unpersisted.example")
+        DNSZone.objects.filter(pk=target.pk).update(soa_serial=200)
+        target.refresh_from_db()
+        _reset_dirty_zones_for_testing()
+
+        self.record.zone = target
+        self.record.comment = "note only"
+        self.record.save(update_fields=["comment"])  # zone deliberately omitted
+
+        self.record.refresh_from_db()
+        self.assertEqual(self.record.zone_id, self.zone.pk, "record must remain in its original zone")
+        self.assertEqual(_refresh_serial(self.zone), 101, "the persisted zone increments once")
+        self.assertEqual(_refresh_serial(target), 200, "the unpersisted target zone must not increment")
 
 
 # ── bulk delete via QuerySet.delete() ──────────────────────────────────────────
@@ -832,7 +852,7 @@ class SOASerialBulkDeleteTestCase(TestCase):
         self.assertEqual(_refresh_serial(self.zone), 601)
 
     def test_model_delete_increments_exactly_once(self):
-        """Regression guard: the receiver must not double-increment with Model.delete()."""
+        """Model.delete() increments the parent zone exactly once."""
         record = TXTRecord.objects.create(name="single-del", text="x", zone=self.zone)
         self._reset_serial()
 
@@ -882,13 +902,14 @@ class SOASerialFailedDeleteCleanupTestCase(TransactionTestCase):
     abort_dispatch_uid = "nautobot_dns_models.tests.abort_txt_delete_after_capture"
 
     def setUp(self):
-        """Create two zones and clear dedup state."""
+        """Create three zones and clear dedup state."""
         _reset_dirty_zones_for_testing()
         self.zone_a = _create_zone("failed-delete-a.example")
         self.zone_b = _create_zone("failed-delete-b.example")
+        self.zone_c = _create_zone("failed-delete-c.example")
 
     def tearDown(self):
-        """Disconnect the test receiver and verify pending delete state did not leak."""
+        """Disconnect the test receiver and clear dedup state."""
         pre_delete.disconnect(sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
         _reset_dirty_zones_for_testing()
 
@@ -916,6 +937,71 @@ class SOASerialFailedDeleteCleanupTestCase(TransactionTestCase):
 
         self.assertEqual(_refresh_serial(self.zone_a), 100, "stale zone A capture must not be consumed")
         self.assertEqual(_refresh_serial(self.zone_b), 101, "zone B delete must still increment")
+
+    def test_failed_nested_delete_does_not_increment_its_zone(self):
+        """A record deleted in a rolled-back nested savepoint must not increment its zone.
+
+        Three distinct zones isolate the scenario: a successful seed delete in zone A, a failed
+        nested delete in zone B, and a successful delete in zone C. Only A and C may increment.
+        """
+        record_a = TXTRecord.objects.create(name="seed-a", text="a", zone=self.zone_a)
+        record_b = TXTRecord.objects.create(name="nested-b", text="b", zone=self.zone_b)
+        record_c = TXTRecord.objects.create(name="outer-c", text="c", zone=self.zone_c)
+        DNSZone.objects.filter(pk__in=[self.zone_a.pk, self.zone_b.pk, self.zone_c.pk]).update(soa_serial=100)
+        _reset_dirty_zones_for_testing()
+
+        def _abort_record_b(sender, instance, **kwargs):  # pylint: disable=unused-argument
+            if instance.pk == record_b.pk:
+                raise RuntimeError("abort nested delete")
+
+        with transaction.atomic():
+            # Seed: successful outer delete establishes the connection-bound delete state.
+            TXTRecord.objects.filter(pk=record_a.pk).delete()
+
+            pre_delete.connect(_abort_record_b, sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+            with self.assertRaises(RuntimeError):
+                with transaction.atomic():
+                    TXTRecord.objects.filter(pk=record_b.pk).delete()
+            pre_delete.disconnect(sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+
+            # Outer continues: delete record_c in zone C.
+            TXTRecord.objects.filter(pk=record_c.pk).delete()
+
+        self.assertEqual(_refresh_serial(self.zone_a), 101, "zone A incremented once for the seed delete")
+        self.assertEqual(_refresh_serial(self.zone_b), 100, "zone B must not increment — its delete rolled back")
+        self.assertEqual(_refresh_serial(self.zone_c), 101, "zone C incremented once for its delete")
+        self.assertTrue(TXTRecord.objects.filter(pk=record_b.pk).exists(), "record B's delete must have rolled back")
+
+    def test_rolled_back_savepoint_does_not_leak_into_a_sibling_at_the_same_depth(self):
+        """A rolled-back nested delete cannot affect a successful sibling delete."""
+        record_a = TXTRecord.objects.create(name="sibling-seed-a", text="a", zone=self.zone_a)
+        record_b = TXTRecord.objects.create(name="sibling-b", text="b", zone=self.zone_b)
+        record_c = TXTRecord.objects.create(name="sibling-c", text="c", zone=self.zone_c)
+        DNSZone.objects.filter(pk__in=[self.zone_a.pk, self.zone_b.pk, self.zone_c.pk]).update(soa_serial=100)
+        _reset_dirty_zones_for_testing()
+
+        def _abort_record_b(sender, instance, **kwargs):  # pylint: disable=unused-argument
+            if instance.pk == record_b.pk:
+                raise RuntimeError("abort first sibling")
+
+        with transaction.atomic():
+            # Seed at the outer scope so the shared delete state outlives the child rollback: the
+            # two children then run at the same depth and must be told apart by savepoint scope.
+            TXTRecord.objects.filter(pk=record_a.pk).delete()
+
+            pre_delete.connect(_abort_record_b, sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+            with self.assertRaises(RuntimeError):
+                with transaction.atomic():  # first child savepoint — rolls back
+                    TXTRecord.objects.filter(pk=record_b.pk).delete()
+            pre_delete.disconnect(sender=TXTRecord, dispatch_uid=self.abort_dispatch_uid)
+
+            with transaction.atomic():  # second child savepoint — same nesting depth, commits
+                TXTRecord.objects.filter(pk=record_c.pk).delete()
+
+        self.assertEqual(_refresh_serial(self.zone_a), 101, "seed delete increments zone A")
+        self.assertEqual(_refresh_serial(self.zone_b), 100, "rolled-back sibling's zone must not increment")
+        self.assertEqual(_refresh_serial(self.zone_c), 101, "successful sibling's zone increments once")
+        self.assertTrue(TXTRecord.objects.filter(pk=record_b.pk).exists(), "record B's delete must have rolled back")
 
 
 # ── rollover test ──────────────────────────────────────────────────────────────

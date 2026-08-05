@@ -6,7 +6,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("nautobot_dns_models", "0009_alter_aaaarecord__ttl_alter_arecord__ttl_and_more"),
+        ("nautobot_dns_models", "0011_dnszone_enabled"),
     ]
 
     operations = [

@@ -5,18 +5,37 @@ The DNS zone model is used to represent a distinct DNS zone. It contains the zon
 Domain registration attributes are modeled separately in `DNSRegistration`.
 
 - `name` (string): Unique FQDN of the Zone, w/ TLD. e.g `example.com`.
+- `enabled` (boolean, default `True`): Indicates whether the zone is eligible for publication by external integrations. This app does not publish zones or enforce this setting.
 - `ttl` (integer): Time to live for the DNS zone.
 - `filename` (string): Filename of the DNS zone file.
 - `description`: (string): Description of the DNS zone.
 - `soa_mname`: (string): FQDN of the authoritative name server for the DNS zone.
-- `soa_rname`: (string): Email address of the administrator for the DNS zone.
-- `soa_refresh`: (integer): Time in seconds for secondary name servers to query the master for the SOA record.
-- `soa_retry`: (integer): Time in seconds for secondary name servers to retry to request the serial number from the master.
-- `soa_expire`: (integer): Time in seconds for secondary name servers to stop answering requests if the master does not respond. This value must be bigger than the sum of refresh and retry.
+- `soa_rname`: (string): Mailbox or single-label placeholder for the person responsible for the DNS zone.
+- `soa_refresh`: (integer): Time in seconds for secondary name servers to query the primary for the SOA record.
+- `soa_retry`: (integer): Time in seconds for secondary name servers to retry to request the serial number from the primary.
+- `soa_expire`: (integer): Time in seconds for secondary name servers to stop answering requests if the primary does not respond. This value must be bigger than the sum of refresh and retry.
 - `soa_serial`: (integer, default `1`): Serial number of the zone (unsigned 32-bit, per [RFC 1035 §3.3.13](https://datatracker.ietf.org/doc/html/rfc1035#section-3.3.13) and [RFC 1982 §7](https://datatracker.ietf.org/doc/html/rfc1982#section-7)). New zones and intentional changes must use values **1–4,294,967,295**: [RFC 2136 §7.11](https://datatracker.ietf.org/doc/html/rfc2136#section-7.11) states a zone's SOA SERIAL should never be set to 0, due to interoperability problems with some older but widely installed DNS implementations. Unchanged legacy zones already at serial 0 remain editable. This value must be incremented each time the zone is changed, and secondary DNS servers must be able to retrieve this value to check if the zone has been updated. See [SOA Serial Auto-Increment](#soa-serial-auto-increment) below.
 - `soa_minimum`: (integer): Minimum TTL for records in this zone.
 - `tenant` (Tenant, optional): Reference to the Tenant model for multi-tenancy support.
 - `auto_create_ptr` (boolean, default `False`): When enabled, creating an A or AAAA record in this zone automatically creates a matching PTR record in the most-specific reverse zone within the same DNS view. If no matching reverse zone exists, the A/AAAA creation fails with a validation error.
+
+## SOA RNAME Formats
+
+An SOA RNAME may be entered as an email address, a basic DNS-style mailbox, or a single-label placeholder. Email-style values must be valid email addresses. Basic DNS-style mailboxes are normalized to email form prior to being saved, and single-label placeholders are stored without a trailing dot.
+
+DNS-style mailbox decoding follows [RFC 1035 §3.3.13](https://www.rfc-editor.org/rfc/rfc1035.html#section-3.3.13)
+and [§8](https://www.rfc-editor.org/rfc/rfc1035.html#section-8). This app stores decoded mailbox values in
+email form as follows:
+
+| Input | Stored value | Result |
+| --- | --- | --- |
+| `admin@example.com` | `admin@example.com` | Accepted unchanged |
+| `admin.example.com.` | `admin@example.com` | Normalized from DNS style |
+| `john\.smith.example.com.` | `john.smith@example.com` | The `\.` escape becomes a dot in the mailbox name per [RFC 1035 §5.1](https://www.rfc-editor.org/rfc/rfc1035.html#section-5.1) |
+| `invalid.` | `invalid` | Single-label placeholder normalized |
+| `john@example` | — | Rejected because the email domain is not fully qualified |
+| `admin\046example.com.` | — | Rejected because the DNS escape is unsupported |
+| `admin..example.com` | — | Rejected because the DNS-style mailbox is malformed |
 
 +++ 1.2.0 "DNS label length rules"
 

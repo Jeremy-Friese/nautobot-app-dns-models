@@ -142,7 +142,7 @@ class DnsZoneViewTest(ViewTestCases.PrimaryObjectViewTestCase):
             soa_refresh=86400,
             soa_retry=7200,
             soa_expire=3600000,
-            soa_serial=0,
+            soa_serial=1,
             soa_minimum=172800,
         )
         DNSZone.objects.create(
@@ -153,7 +153,7 @@ class DnsZoneViewTest(ViewTestCases.PrimaryObjectViewTestCase):
             soa_refresh=86400,
             soa_retry=7200,
             soa_expire=3600000,
-            soa_serial=0,
+            soa_serial=1,
             soa_minimum=172800,
         )
         DNSZone.objects.create(
@@ -164,7 +164,7 @@ class DnsZoneViewTest(ViewTestCases.PrimaryObjectViewTestCase):
             soa_refresh=86400,
             soa_retry=7200,
             soa_expire=3600000,
-            soa_serial=0,
+            soa_serial=1,
             soa_minimum=172800,
         )
 
@@ -180,14 +180,14 @@ class DnsZoneViewTest(ViewTestCases.PrimaryObjectViewTestCase):
             "soa_refresh": 86400,
             "soa_retry": 7200,
             "soa_expire": 3600000,
-            "soa_serial": 0,
+            "soa_serial": 1,
             "soa_minimum": 172800,
             "enabled": True,
         }
 
         cls.csv_data = (
             "name, dns_view, ttl, description, filename, soa_mname, soa_rname, soa_refresh, soa_retry, soa_expire, soa_serial, soa_minimum",
-            f"Test 3, {dns_view.id}, 3600, Description 3, filename 3, auth-server, admin@example_three.com, 86400, 7200, 3600000, 0, 172800",
+            f"Test 3, {dns_view.id}, 3600, Description 3, filename 3, auth-server, admin@example_three.com, 86400, 7200, 3600000, 1, 172800",
         )
 
         cls.bulk_edit_data = {

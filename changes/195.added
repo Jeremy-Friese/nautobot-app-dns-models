@@ -1,0 +1,1 @@
+Added optional automatic SOA serial increments for DNS record and DNS-serving zone-data changes. Increments are coalesced to one advance per zone per database transaction, metadata-only edits do not advance the serial, and while enabled the serial is managed automatically (manual writes are rejected or ignored).

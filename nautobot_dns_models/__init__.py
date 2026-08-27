@@ -91,14 +91,24 @@ class NautobotDnsModelsConfig(NautobotAppConfig):
             help_text="Enforce CNAME exclusivity",
             field_type=bool,
         ),
+        "SOA_SERIAL_AUTO_INCREMENT": ConstanceConfigItem(
+            default=False,
+            help_text=(
+                "Automatically increment SOA serial number when zone data changes. "
+                "Incompatible with date-based serial schemes (e.g., YYYYMMDDNN)."
+            ),
+            field_type=bool,
+        ),
     }
 
     def ready(self):
         """Connect the app's signal handlers."""
         super().ready()
         # Deferred for app-registry timing: `signals` imports `models`, which cannot load while this module is
-        # imported during settings setup.
-        from nautobot_dns_models import signals  # noqa: F401  pylint: disable=import-outside-toplevel,unused-import
+        # imported during settings setup. Importing the module also registers its `@receiver` handlers.
+        from nautobot_dns_models.signals import connect_dns_record_signals  # pylint: disable=import-outside-toplevel
+
+        connect_dns_record_signals()
 
 
 config = NautobotDnsModelsConfig  # pylint:disable=invalid-name

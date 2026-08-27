@@ -1,0 +1,3 @@
+New DNS zones now start with a SOA serial of 1.
+Setting a zone's SOA serial to 0 is now rejected, both on new zones and when changing an existing nonzero serial back to 0.
+Zones already stored with a serial of 0 remain editable and advance to 1 on their next automatic serial increment.

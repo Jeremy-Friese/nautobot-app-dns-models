@@ -1,5 +1,6 @@
 """Forms for nautobot_dns_models."""
 
+from constance import config as constance_config
 from django import forms
 from nautobot.apps.forms import (
     BulkEditNullBooleanSelect,
@@ -263,6 +264,15 @@ class DNSZoneForm(EnabledBeforeDescriptionMixin, NautobotModelForm, TenancyForm)
         label="View",
     )
 
+    def __init__(self, *args, **kwargs):
+        """Disable soa_serial in the UI while auto-increment manages it."""
+        super().__init__(*args, **kwargs)
+        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
+            soa_serial = self.fields.get("soa_serial")
+            if soa_serial is not None:
+                soa_serial.disabled = True
+                soa_serial.help_text = "Managed automatically while SOA serial auto-increment is enabled."
+
     class Meta:
         """Meta attributes."""
 
@@ -336,6 +346,15 @@ class DNSZoneBulkEditForm(TagsBulkEditFormMixin, NautobotBulkEditForm):
         required=False, label="Auto-create PTR Records", widget=BulkEditNullBooleanSelect
     )
     enabled = forms.NullBooleanField(required=False, widget=BulkEditNullBooleanSelect)
+
+    def __init__(self, *args, **kwargs):
+        """Disable soa_serial in the bulk-edit UI while auto-increment manages it."""
+        super().__init__(*args, **kwargs)
+        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
+            soa_serial = self.fields.get("soa_serial")
+            if soa_serial is not None:
+                soa_serial.disabled = True
+                soa_serial.help_text = "Managed automatically while SOA serial auto-increment is enabled."
 
     class Meta:
         """Meta attributes."""

@@ -19,12 +19,13 @@ The DNS related configuration from other systems such as Infoblox, Bluecat, or B
 
 Create a DNS Zone
 
-```bash 
+```bash
 curl -X 'POST' http://$NAUTOBOT_HOST/api/plugins/dns/dns-zones/ \
--H 'Content-Type: application/json' 
--H 'Authorization: Token $NAUTOBOT_API_TOKEN' 
+-H 'Content-Type: application/json' \
+-H "Authorization: Token $NAUTOBOT_API_TOKEN" \
 -d '{
   "name": "nautobot.com",
+  "dns_view": "'"$DNS_VIEW_ID"'",
   "ttl": 3600,
   "filename": "nautobot.com",
   "soa_mname": "ns1.cloudns.net",
@@ -32,10 +33,12 @@ curl -X 'POST' http://$NAUTOBOT_HOST/api/plugins/dns/dns-zones/ \
   "soa_refresh": 86400,
   "soa_retry": 7200,
   "soa_expire": 3600000,
-  "soa_serial": 0,
+  "soa_serial": 1,
   "soa_minimum": 3600
-}' 
+}'
 ```
+
+`$DNS_VIEW_ID` is the UUID of an existing DNS View (see the DNS Views API endpoint). With SOA serial auto-increment enabled, omit `soa_serial` or set it to `1`; a different value is rejected for a new zone.
 
 Add an A record to a DNS Zone.
 
@@ -43,7 +46,7 @@ Add an A record to a DNS Zone.
 curl -X 'POST' \
   http://$NAUTOBOT_HOST/api/plugins/dns/a-records/ \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Token $NAUTOBOT_API_TOKEN' \
+  -H "Authorization: Token $NAUTOBOT_API_TOKEN" \
   -d '{
   "name": "dns-zone.example",
   "description": "Main Web Server",

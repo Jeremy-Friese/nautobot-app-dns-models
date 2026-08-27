@@ -84,3 +84,11 @@ This setting controls the DNS validation level applied to zones and records:
     - A CNAME cannot co-exist with any other record type that has the exact same `name` in the same `zone`.
     - Conversely, a non‑CNAME record cannot co-exist where a CNAME with the exact same `name` exists in the same `zone`.
     - Name comparison is exact. A zone‑qualified `name` such as `host.example.com` is distinct from the relative `host` under zone `example.com`. A trailing dot is ignored (e.g., `host.example.com.` is treated as `host.example.com`).
+
+`SOA_SERIAL_AUTO_INCREMENT` (default: "False")
+
+- **Disabled** - SOA serial numbers are not automatically incremented. Users must manage serial numbers manually.
+- **Enabled** - Automatically advances the `soa_serial` field on a `DNSZone` when DNS-serving zone data changes: a record is created or deleted, a record's published DNS data changes, or a DNS-serving zone field (such as `name`, `enabled`, `ttl`, `filename`, or any SOA parameter) changes. Increments are coalesced to a single advance per zone per database transaction, and metadata-only edits (description, comment, tenant, custom fields) do not increment. While enabled, the serial is managed automatically: the REST API and model validation reject a manual value — including a non-default serial when creating a zone, so managed zones are created at serial `1` — while the GUI forms disable the field and ignore any submitted value. See the [DNS Zone model documentation](../models/dnszone.md#soa-serial-auto-increment) for full details.
+
+!!! note "Consider your serial scheme first"
+    Auto-increment advances `soa_serial` by 1 per changing transaction, so it is best suited to zones whose serials are simple incrementing counters. If you use a date-based scheme (e.g., `YYYYMMDDNN`), leaving this option disabled is usually the better fit: incrementing by 1 moves the serial away from the encoded date, which can surprise external tooling, scripts, or processes that set or expect date-formatted serials. You can also disable it per rollout and manage those zones' serials manually.

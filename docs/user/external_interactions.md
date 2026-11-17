@@ -38,7 +38,7 @@ curl -X 'POST' http://$NAUTOBOT_HOST/api/plugins/dns/dns-zones/ \
 }'
 ```
 
-`$DNS_VIEW_ID` is the UUID of an existing DNS View (see the DNS Views API endpoint). With SOA serial auto-increment enabled, omit `soa_serial` or set it to `1`; a different value is rejected for a new zone.
+`$DNS_VIEW_ID` is the UUID of an existing DNS View (see the DNS Views API endpoint). With SOA serial auto-increment enabled, a submitted `soa_serial` is ignored and the new zone starts at serial `1`.
 
 Add an A record to a DNS Zone.
 

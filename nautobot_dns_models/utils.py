@@ -99,16 +99,11 @@ def _discard_state(conn, attr_name):
 
 
 def _callback_is_pending(conn, hook):
-    """Return True if ``hook`` is still registered in ``conn``'s pending on_commit callbacks.
+    """Return True if ``hook`` is still among ``conn``'s pending on_commit callbacks.
 
-    ``connection.run_on_commit`` is a Django internal: tuples whose 2nd element is the callback --
-    ``(sids, func)`` through Django 4.1, ``(sids, func, robust)`` from 4.2 on, and both 4.2 and 5.2
-    are in play for this app.  An unrecognised shape degrades to "assume stale" rather than
-    raising IndexError.
-
-    Private-API dependency: revalidate this parsing (and the ``savepoint_ids`` keying in
-    ``signals.py``) whenever the supported Django range changes; the ``SOASerialLiveness`` and
-    savepoint test suites exercise it.
+    ``connection.run_on_commit`` is a Django internal holding ``(savepoint_ids, func, robust)`` tuples; an
+    entry of any other shape reads as not pending. Recheck this, and the ``savepoint_ids`` keying in
+    ``signals.py``, when the supported Django range changes.
     """
     for entry in getattr(conn, "run_on_commit", ()):
         try:
@@ -117,6 +112,7 @@ def _callback_is_pending(conn, hook):
         except (IndexError, TypeError):  # pragma: no cover - future Django callback shape
             if callable(entry) and entry is hook:
                 return True
+
     return False
 
 
@@ -143,6 +139,7 @@ def register_transaction_marker():
         transaction.on_commit(_marker)
     except transaction.TransactionManagementError:
         return None
+
     return _marker
 
 
@@ -155,6 +152,7 @@ def transaction_marker_is_pending(marker):
     """
     if marker is None:
         return False
+
     return _callback_is_pending(transaction.get_connection(), marker)
 
 

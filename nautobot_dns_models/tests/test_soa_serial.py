@@ -27,6 +27,7 @@ from nautobot_dns_models.models import (
     AAAARecord,
     ARecord,
     CNAMERecord,
+    DNSView,
     DNSZone,
     MXRecord,
     NSRecord,
@@ -1248,9 +1249,9 @@ class SOASerialSavepointMarkerTestCase(TestCase):
         """A dirty hit whose marker is pending returns the recorded serial without reading the zone."""
         zone = _create_zone("marker-no-query.example")
         with transaction.atomic():
-            first = DNSZone._bump_zone_serial(zone.pk)  # pylint: disable=protected-access
+            first = DNSZone.bump_zone_serial(zone.pk)
         with self.assertNumQueries(0):
-            second = DNSZone._bump_zone_serial(zone.pk)  # pylint: disable=protected-access
+            second = DNSZone.bump_zone_serial(zone.pk)
         self.assertEqual((first, second), (1, 1))
 
     def test_each_zone_follows_its_own_marker(self):
@@ -1332,7 +1333,7 @@ class TransactionMarkerTestCase(TestCase):
         markers = []
         with self.assertRaises(RuntimeError):
             with transaction.atomic():
-                DNSZone._bump_zone_serial(zone.pk)  # pylint: disable=protected-access
+                DNSZone.bump_zone_serial(zone.pk)
                 markers.append(_get_dirty_zones()[zone.pk][1])
                 self.assertTrue(transaction_marker_is_pending(markers[0]))
                 raise RuntimeError("roll back the bump")
@@ -1682,45 +1683,70 @@ class SOASerialAPITestCase(APITestCase):
         self.assertEqual(_refresh_serial(self.api_zone), 1, "zone 1 must coalesce to one increment for its two records")
         self.assertEqual(_refresh_serial(self.api_zone2), 1, "zone 2 must coalesce to one increment for its one record")
 
-    def test_api_patch_serial_change_rejected_when_auto_increment_enabled(self):
-        """PATCH that changes soa_serial directly must be rejected when auto-increment is on."""
+    def test_api_patch_serial_is_ignored_when_auto_increment_enabled(self):
+        """A PATCH that sends `soa_serial` succeeds and leaves the serial alone."""
         self.add_permissions(
             "nautobot_dns_models.view_dnszone",
             "nautobot_dns_models.change_dnszone",
         )
         url = reverse("plugins-api:nautobot_dns_models-api:dnszone-detail", kwargs={"pk": self.api_zone.pk})
         response = self.client.patch(url, data={"soa_serial": 999}, format="json", **self.header)
-        self.assertHttpStatus(response, http_status.HTTP_400_BAD_REQUEST)
-        self.assertIn("soa_serial", response.data)
-        self.assertEqual(_refresh_serial(self.api_zone), 0, "serial must not change after rejected PATCH")
+        self.assertHttpStatus(response, http_status.HTTP_200_OK)
+        self.assertEqual(response.data["soa_serial"], 0)
+        self.assertEqual(_refresh_serial(self.api_zone), 0)
+
+    def test_api_put_of_a_previously_read_zone_succeeds_after_the_serial_advanced(self):
+        """A zone body read before a record change can still be written back; its old serial is ignored."""
+        self.add_permissions(
+            "nautobot_dns_models.view_dnszone",
+            "nautobot_dns_models.change_dnszone",
+            "nautobot_dns_models.view_dnsview",
+        )
+        _set_serial_in_db(5, self.api_zone)
+        url = reverse("plugins-api:nautobot_dns_models-api:dnszone-detail", kwargs={"pk": self.api_zone.pk})
+        body = {
+            "name": self.api_zone.name,
+            "dns_view": str(self.api_zone.dns_view_id),
+            "filename": self.api_zone.filename,
+            "soa_mname": self.api_zone.soa_mname,
+            "soa_rname": self.api_zone.soa_rname,
+            "soa_serial": 5,
+            "description": "written back",
+        }
+        _set_serial_in_db(6, self.api_zone)
+
+        response = self.client.put(url, data=body, format="json", **self.header)
+
+        self.assertHttpStatus(response, http_status.HTTP_200_OK)
+        self.api_zone.refresh_from_db()
+        self.assertEqual(self.api_zone.description, "written back")
+        self.assertEqual(self.api_zone.soa_serial, 6)
 
     def test_api_zone_create_serial_policy(self):
-        """POST to create a zone follows the managed-serial invariant:
-        non-default serial is rejected while managed; default (1) is accepted; any valid serial
-        is accepted when auto-increment is disabled."""
+        """A submitted serial is ignored on create while managed, and used when auto-increment is off."""
         self.add_permissions("nautobot_dns_models.add_dnszone", "nautobot_dns_models.view_dnsview")
         url = reverse("plugins-api:nautobot_dns_models-api:dnszone-list")
         cases = [
             {
                 "label": "non_default_managed",
-                "zone_name": "api-create-reject.example",
+                "zone_name": "api-create-ignored.example",
                 "soa_serial": 999,
                 "managed": True,
-                "expect_status": http_status.HTTP_400_BAD_REQUEST,
+                "expect_serial": 1,
             },
             {
                 "label": "default_managed",
                 "zone_name": "api-create-ok.example",
                 "soa_serial": 1,
                 "managed": True,
-                "expect_status": http_status.HTTP_201_CREATED,
+                "expect_serial": 1,
             },
             {
                 "label": "unmanaged_any_serial",
                 "zone_name": "api-create-unmanaged.example",
                 "soa_serial": 999,
                 "managed": False,
-                "expect_status": http_status.HTTP_201_CREATED,
+                "expect_serial": 999,
             },
         ]
         for case in cases:
@@ -1738,9 +1764,8 @@ class SOASerialAPITestCase(APITestCase):
                 else:
                     with override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=False):
                         response = self.client.post(url, data=data, format="json", **self.header)
-                self.assertHttpStatus(response, case["expect_status"])
-                if case["expect_status"] == http_status.HTTP_400_BAD_REQUEST:
-                    self.assertIn("soa_serial", response.data)
+                self.assertHttpStatus(response, http_status.HTTP_201_CREATED)
+                self.assertEqual(DNSZone.objects.get(name=case["zone_name"]).soa_serial, case["expect_serial"])
 
 
 # ── delete edge-case tests ─────────────────────────────────────────────────────
@@ -1929,3 +1954,115 @@ class SOASerialFormPolicyTestCase(TestCase):
                     form.is_valid(), f"form must allow serial change when auto-increment is off: {form.errors}"
                 )
                 self.assertEqual(form.cleaned_data["soa_serial"], 999, "the submitted change must be accepted")
+
+
+# ── interaction with zone parent derivation ───────────────────────────────────
+
+
+@override_config(nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT=True)
+class SOASerialZoneHierarchyTestCase(TestCase):
+    """Test that zone parent derivation and serial auto-increment work together."""
+
+    def setUp(self):
+        """Create a parent zone and a child zone, both at serial 5."""
+        self.parent = _create_zone("hier.example", serial=5)
+        self.child = _create_zone("apps.hier.example", serial=5)
+
+    def _assert_zone(self, zone, parent, serial):
+        """Assert the zone's stored parent and serial."""
+        zone.refresh_from_db()
+        self.assertEqual(zone.parent, parent)
+        self.assertEqual(zone.soa_serial, serial)
+
+    def test_new_zone_gets_parent_without_bumping_any_serial(self):
+        """Creating a child zone sets its parent and leaves both serials alone."""
+        self._assert_zone(self.child, self.parent, 5)
+        self._assert_zone(self.parent, None, 5)
+
+    def test_new_enclosing_zone_reparents_others_without_bumping_them(self):
+        """A zone created between two existing zones takes over as parent; the reparented zone's serial stays."""
+        deep = _create_zone("deep.corp.hier.example", serial=5)
+        self._assert_zone(deep, self.parent, 5)
+
+        corp = _create_zone("corp.hier.example", serial=5)
+
+        self._assert_zone(deep, corp, 5)
+        self._assert_zone(corp, self.parent, 5)
+        self._assert_zone(self.parent, None, 5)
+
+    def test_rename_bumps_the_serial_and_recomputes_the_parent(self):
+        """Renaming a zone out of its parent bumps only its own serial and clears its parent."""
+        self.child.name = "apps.elsewhere.example"
+        self.child.save()
+
+        self.assertEqual(self.child.soa_serial, 6)
+        self.assertIsNone(self.child.parent)
+        self._assert_zone(self.child, None, 6)
+        self._assert_zone(self.parent, None, 5)
+
+    def test_renaming_a_parent_bumps_only_the_parent(self):
+        """Renaming a parent zone orphans its child without bumping the child's serial."""
+        self.parent.name = "moved.example"
+        self.parent.save()
+
+        self._assert_zone(self.parent, None, 6)
+        self._assert_zone(self.child, None, 5)
+
+    def test_rename_with_update_fields_bumps_and_recomputes_the_parent(self):
+        """A rename saved with `update_fields` behaves like a full save."""
+        self.child.name = "apps.elsewhere.example"
+        self.child.save(update_fields=["name"])
+
+        self._assert_zone(self.child, None, 6)
+
+    def test_rename_from_a_stale_instance_increments_the_stored_serial(self):
+        """A rename from an instance loaded before the serial advanced builds on the stored serial."""
+        stale = DNSZone.objects.get(pk=self.child.pk)
+        _set_serial_in_db(9, self.child)
+
+        stale.name = "apps.elsewhere.example"
+        stale.save()
+
+        self.assertEqual(stale.soa_serial, 10)
+        self._assert_zone(self.child, None, 10)
+
+    def test_view_move_bumps_the_serial_and_recomputes_the_parent(self):
+        """Moving a zone to another DNS view bumps its serial, as a full save or with `update_fields`."""
+        other_view = DNSView.objects.create(name="Hierarchy Other")
+        for index, update_fields in enumerate((None, ["dns_view"], ["dns_view_id"])):
+            with self.subTest(update_fields=update_fields):
+                zone = _create_zone(f"move{index}.hier.example", serial=5)
+                zone.dns_view = other_view
+                zone.save(update_fields=update_fields)
+
+                self._assert_zone(zone, None, 6)
+                self.assertEqual(zone.dns_view, other_view)
+
+        self._assert_zone(self.parent, None, 5)
+
+    def test_watched_field_change_keeps_the_parent(self):
+        """A watched-field change that keeps the name bumps the serial and keeps the parent."""
+        self.child.ttl = 7200
+        self.child.save()
+
+        self._assert_zone(self.child, self.parent, 6)
+
+    def test_unwatched_field_change_keeps_parent_and_serial(self):
+        """A description change touches neither the parent nor the serial."""
+        self.child.description = "Application zone"
+        self.child.save()
+
+        self._assert_zone(self.child, self.parent, 5)
+
+    def test_record_change_bumps_the_serial_and_keeps_the_parent(self):
+        """A record created in a child zone bumps that zone only and leaves the hierarchy alone."""
+        TXTRecord.objects.create(name="note", text="hello", zone=self.child)
+
+        self._assert_zone(self.child, self.parent, 6)
+        self._assert_zone(self.parent, None, 5)
+
+    def test_deleting_a_parent_reparents_children_without_bumping_them(self):
+        """Deleting a parent zone clears its child's parent and leaves the child's serial alone."""
+        self.parent.delete()
+
+        self._assert_zone(self.child, None, 5)

@@ -255,7 +255,20 @@ class DNSRegistrationFilterForm(NautobotFilterForm):
     ]
 
 
-class DNSZoneForm(EnabledBeforeDescriptionMixin, NautobotModelForm, TenancyForm):
+class ManagedSOASerialMixin:
+    """Disable the `soa_serial` field while SOA serial auto-increment manages it."""
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the form and disable `soa_serial` if auto-increment is enabled."""
+        super().__init__(*args, **kwargs)
+        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
+            soa_serial = self.fields.get("soa_serial")
+            if soa_serial is not None:
+                soa_serial.disabled = True
+                soa_serial.help_text = "Managed automatically while SOA serial auto-increment is enabled."
+
+
+class DNSZoneForm(ManagedSOASerialMixin, EnabledBeforeDescriptionMixin, NautobotModelForm, TenancyForm):
     """DNSZone creation/edit form."""
 
     dns_view = DynamicModelChoiceField(
@@ -264,15 +277,6 @@ class DNSZoneForm(EnabledBeforeDescriptionMixin, NautobotModelForm, TenancyForm)
         label="View",
     )
 
-    def __init__(self, *args, **kwargs):
-        """Disable soa_serial in the UI while auto-increment manages it."""
-        super().__init__(*args, **kwargs)
-        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
-            soa_serial = self.fields.get("soa_serial")
-            if soa_serial is not None:
-                soa_serial.disabled = True
-                soa_serial.help_text = "Managed automatically while SOA serial auto-increment is enabled."
-
     class Meta:
         """Meta attributes."""
 
@@ -280,7 +284,7 @@ class DNSZoneForm(EnabledBeforeDescriptionMixin, NautobotModelForm, TenancyForm)
         fields = "__all__"
 
 
-class DNSZoneBulkEditForm(TagsBulkEditFormMixin, NautobotBulkEditForm):
+class DNSZoneBulkEditForm(ManagedSOASerialMixin, TagsBulkEditFormMixin, NautobotBulkEditForm):
     """DNSZone bulk edit form."""
 
     pk = forms.ModelMultipleChoiceField(queryset=models.DNSZone.objects.all(), widget=forms.MultipleHiddenInput)
@@ -347,15 +351,6 @@ class DNSZoneBulkEditForm(TagsBulkEditFormMixin, NautobotBulkEditForm):
         required=False, label="Auto-create PTR Records", widget=BulkEditNullBooleanSelect
     )
     enabled = forms.NullBooleanField(required=False, widget=BulkEditNullBooleanSelect)
-
-    def __init__(self, *args, **kwargs):
-        """Disable soa_serial in the bulk-edit UI while auto-increment manages it."""
-        super().__init__(*args, **kwargs)
-        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
-            soa_serial = self.fields.get("soa_serial")
-            if soa_serial is not None:
-                soa_serial.disabled = True
-                soa_serial.help_text = "Managed automatically while SOA serial auto-increment is enabled."
 
     class Meta:
         """Meta attributes."""

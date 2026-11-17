@@ -1,5 +1,6 @@
 """API serializers for nautobot_dns_models."""
 
+from constance import config as constance_config
 from drf_spectacular.utils import extend_schema_field
 from nautobot.apps.api import NautobotModelSerializer, ValidatedModelSerializer
 from rest_framework import serializers
@@ -66,6 +67,14 @@ class DNSZoneSerializer(NautobotModelSerializer):
         model = models.DNSZone
         fields = "__all__"
         extra_kwargs = {"dns_view": {"default": models.get_default_view}}
+
+    def to_internal_value(self, data):
+        """Validate the input, dropping `soa_serial` while SOA serial auto-increment manages it."""
+        attrs = super().to_internal_value(data)
+        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
+            attrs.pop("soa_serial", None)
+
+        return attrs
 
 
 class DNSRecordSerializer(NautobotModelSerializer):

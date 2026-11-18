@@ -9,7 +9,7 @@ from constance import config as constance_config
 from constance.test import override_config
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ValidationError
-from django.db import connection, transaction
+from django.db import DatabaseError, connection, transaction
 from django.db.models import F
 from django.db.models.signals import pre_delete
 from django.test.utils import CaptureQueriesContext
@@ -1786,30 +1786,36 @@ class SOASerialDeleteEdgeCaseTestCase(TestCase):
         stale.delete()
         self.assertEqual(_refresh_serial(zone), 1, "zero-row delete of stale reference must not increment")
 
-    def test_save_on_missing_row_does_not_raise_and_does_not_increment(self):
-        """With the flag ON, saving a stale instance after its row is deleted must not raise DoesNotExist."""
+    def test_full_save_of_a_deleted_record_reinserts_it_and_increments(self):
+        """A full save of a stale instance whose row was deleted inserts the row again and bumps the zone."""
         zone = _create_zone("missing-save.example", serial=0)
         record = TXTRecord.objects.create(name="missing-r", text="a", zone=zone)
-        record_pk = record.pk  # preserve before delete clears record.pk
-        _set_serial_in_db(0, zone)
-
+        record_pk = record.pk
         stale = TXTRecord.objects.get(pk=record_pk)
-        record.delete()  # row gone; serial -> 1
+        record.delete()
+        _set_serial_in_db(5, zone)
 
-        serial_after_delete = _refresh_serial(zone)
-
-        # Must not raise DoesNotExist; must not advance the serial beyond the delete.
         stale.text = "updated"
-        stale.save()  # Django INSERT-on-missing-row resurrects it; the feature must not change this
+        stale.save()
 
-        self.assertEqual(
-            _refresh_serial(zone),
-            serial_after_delete,
-            "saving a stale instance onto a missing row must not increment the serial",
-        )
-        resurrected = TXTRecord.objects.filter(pk=record_pk).first()
-        self.assertIsNotNone(resurrected, "Django's native save() resurrects the row via INSERT")
-        self.assertEqual(resurrected.text, "updated", "the resurrected row carries the new text value")
+        self.assertEqual(_refresh_serial(zone), 6)
+        self.assertEqual(TXTRecord.objects.get(pk=record_pk).text, "updated")
+
+    def test_update_fields_save_of_a_deleted_record_raises_and_does_not_increment(self):
+        """An ``update_fields`` save of a stale instance whose row was deleted raises and leaves the serial alone."""
+        zone = _create_zone("missing-partial.example", serial=0)
+        record = TXTRecord.objects.create(name="missing-r", text="a", zone=zone)
+        record_pk = record.pk
+        stale = TXTRecord.objects.get(pk=record_pk)
+        record.delete()
+        _set_serial_in_db(5, zone)
+
+        stale.text = "updated"
+        with self.assertRaises(DatabaseError), transaction.atomic():
+            stale.save(update_fields=["text"])
+
+        self.assertEqual(_refresh_serial(zone), 5)
+        self.assertFalse(TXTRecord.objects.filter(pk=record_pk).exists())
 
     def test_delete_still_increments_when_flag_disabled_after_pre_delete(self):
         """Disabling the flag between pre_delete and post_delete must not cancel the captured increment."""

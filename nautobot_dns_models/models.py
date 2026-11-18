@@ -942,7 +942,8 @@ class DNSRecord(DNSModel):
         """Save, and bump the affected zones' SOA serials when the record's published DNS data changed.
 
         A create, a move to another zone, or a change to a published field bumps. An edit to the description,
-        comment or custom fields does not.
+        comment or custom fields does not. A full save of an instance whose row was deleted since it was loaded
+        inserts the row again, and counts as a create.
         """
         # Materialize update_fields once, so a generator is not exhausted before super().save() reads it.
         update_fields_set = kwargs.get("update_fields")
@@ -956,14 +957,9 @@ class DNSRecord(DNSModel):
             super().save(*args, **kwargs)
             return
 
-        is_update = not self._state.adding
         with transaction.atomic():
-            before = self._soa_locked_snapshot() if is_update else None
+            before = None if self._state.adding else self._soa_locked_snapshot()
             super().save(*args, **kwargs)
-
-            # An update whose row another transaction already deleted has nothing published to bump.
-            if is_update and before is None:
-                return
 
             for zone_id in self._soa_zones_to_bump(update_fields_set, before):
                 DNSZone.bump_zone_serial(zone_id)

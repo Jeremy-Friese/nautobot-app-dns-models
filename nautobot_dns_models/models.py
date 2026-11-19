@@ -3,10 +3,40 @@
 from constance import config as constance_config
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator
-from django.db import models
+from django.db import models, transaction
 from nautobot.apps.models import BaseModel, PrimaryModel, extras_features
 from nautobot.core.models.fields import ForeignKeyWithAutoRelatedName
 from nautobot.ipam.choices import IPAddressVersionChoices
+
+from nautobot_dns_models.utils import (
+    get_transaction_scoped_state,
+    register_transaction_marker,
+    transaction_marker_is_pending,
+)
+
+# Connection attribute holding the per-transaction {zone_pk: (serial, marker)} coalescing map.
+# A zone bumped once in a transaction is not bumped again while its marker is pending, so any
+# number of changes to one zone in one transaction advance its serial by one. The map covers the
+# whole transaction rather than one savepoint, so bumps also coalesce across released savepoints.
+_SOA_SERIAL_DIRTY_ATTR = "_soa_serial_dirty_zones"
+
+
+def _get_dirty_zones():
+    """Return the connection-bound, transaction-scoped ``{zone_pk: (serial, marker)}`` coalescing map."""
+    return get_transaction_scoped_state(_SOA_SERIAL_DIRTY_ATTR, dict)["payload"]
+
+
+# Largest serial the `soa_serial` column can hold. The column is a signed 32-bit integer, so the upper half
+# of the RFC 1982 serial space cannot be stored.
+SOA_SERIAL_MAX = 2147483647
+
+SOA_SERIAL_MANAGED_MESSAGE = (
+    "The SOA serial is managed automatically when auto-increment is enabled. "
+    "Disable auto-increment to set the serial manually."
+)
+# Fields written by the internal serial bump. last_updated is carried so the zone's change-logged
+# timestamp advances with the serial (auto_now only updates fields named in update_fields).
+_SOA_SERIAL_INTERNAL_UPDATE_FIELDS = frozenset({"soa_serial", "last_updated"})
 
 
 def dns_wire_label_length(label):
@@ -144,6 +174,29 @@ def get_default_view_pk():
 class DNSZone(DNSModel):
     """Model for DNS SOA Records. An SOA Record defines a DNS Zone."""
 
+    # Serial as last loaded from the database; clean() compares against it to reject manual
+    # changes. ``None`` means not loaded — a new instance, or a deferred serial never read.
+    _initial_soa_serial = None
+
+    @classmethod
+    def from_db(cls, db, field_names, values):
+        """Snapshot the loaded serial for clean(); a deferred serial is left unread and recorded as None."""
+        instance = super().from_db(db, field_names, values)
+        # pylint: disable-next=protected-access,no-member
+        instance._initial_soa_serial = instance.soa_serial if "soa_serial" in field_names else None
+
+        return instance
+
+    # ``fields`` is named so the override can tell whether ``soa_serial`` was refreshed.
+    # pylint: disable=keyword-arg-before-vararg
+    def refresh_from_db(self, using=None, fields=None, *args, **kwargs):
+        """Refresh from the database, and update the serial snapshot if ``soa_serial`` was refreshed."""
+        if fields is not None:
+            fields = list(fields)
+        super().refresh_from_db(using, fields, *args, **kwargs)
+        if fields is None or "soa_serial" in fields:
+            self._initial_soa_serial = self.soa_serial
+
     name = models.CharField(max_length=200, help_text="FQDN of the Zone, w/ TLD. e.g example.com")
     dns_view = ForeignKeyWithAutoRelatedName(
         DNSView,
@@ -205,6 +258,173 @@ class DNSZone(DNSModel):
         verbose_name = "DNS Zone"
         verbose_name_plural = "DNS Zones"
 
+    # Attribute names of the fields that trigger a serial increment when changed on the zone itself.
+    _SOA_SERIAL_WATCHED_FIELDS = frozenset(
+        {
+            "name",
+            "dns_view_id",
+            "ttl",
+            "filename",
+            "soa_mname",
+            "soa_rname",
+            "soa_refresh",
+            "soa_retry",
+            "soa_expire",
+            "soa_minimum",
+        }
+    )
+
+    # Set by bump_zone_serial on the instance it is about to save, so save() writes that serial through.
+    _soa_serial_internal_bump = False
+
+    @classmethod
+    def bump_zone_serial(cls, zone_id):
+        """Advance a zone's SOA serial by one, at most once per transaction, and return the serial.
+
+        Returns None if the zone no longer exists. At ``SOA_SERIAL_MAX`` the serial wraps to 1.
+        Callers check ``SOA_SERIAL_AUTO_INCREMENT`` and must be inside a transaction.
+        """
+        dirty = _get_dirty_zones()
+        entry = dirty.get(zone_id)
+        if entry is not None:
+            # A pending marker means no savepoint rollback undid the earlier bump, so it still stands.
+            serial, marker = entry
+            if transaction_marker_is_pending(marker):
+                return serial
+
+            del dirty[zone_id]
+
+        zone = cls.objects.select_for_update().filter(pk=zone_id).first()
+        if zone is None:
+            return None
+
+        zone.soa_serial = 1 if zone.soa_serial >= SOA_SERIAL_MAX else zone.soa_serial + 1
+        zone._soa_serial_internal_bump = True  # pylint: disable=protected-access
+        zone.save(update_fields=_SOA_SERIAL_INTERNAL_UPDATE_FIELDS)
+        # Registered at the savepoint nesting of the serial write, so rolling that write back drops the marker.
+        marker = register_transaction_marker()
+        dirty[zone_id] = (zone.soa_serial, marker)
+
+        return zone.soa_serial
+
+    def increment_soa_serial(self):
+        """Advance this zone's SOA serial by one and update this instance to match."""
+        with transaction.atomic(savepoint=False):
+            new_serial = type(self).bump_zone_serial(self.pk)
+        if new_serial is not None:
+            self.soa_serial = new_serial
+            self._initial_soa_serial = new_serial
+
+    def save(self, *args, **kwargs):
+        """Save, and bump the serial on zone self-changes.
+
+        While auto-increment is on the serial is managed: a full save keeps the stored serial, and an
+        ``update_fields`` save that names ``soa_serial`` raises if the serial was changed.
+        """
+        # Materialize update_fields once, so a generator is not exhausted before super().save() reads it.
+        update_fields_set = kwargs.get("update_fields")
+        if update_fields_set is not None:
+            update_fields_set = frozenset(update_fields_set)
+            kwargs["update_fields"] = update_fields_set
+
+        internal_bump = self._soa_serial_internal_bump
+        self._soa_serial_internal_bump = False
+
+        if internal_bump and update_fields_set == _SOA_SERIAL_INTERNAL_UPDATE_FIELDS:
+            super().save(*args, **kwargs)
+            self._initial_soa_serial = self.soa_serial
+            return
+
+        if update_fields_set is not None and not update_fields_set:
+            super().save(*args, **kwargs)
+            return
+
+        if not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
+            super().save(*args, **kwargs)
+            if update_fields_set is None or "soa_serial" in update_fields_set:
+                self._initial_soa_serial = self.soa_serial
+            return
+
+        if not self.present_in_database:
+            super().save(*args, **kwargs)
+            self._initial_soa_serial = self.soa_serial
+            return
+
+        update_fields_set = self._managed_soa_serial_update_fields(update_fields_set)
+        kwargs["update_fields"] = update_fields_set
+
+        watched = self._SOA_SERIAL_WATCHED_FIELDS
+        if update_fields_set is not None:
+            written = update_fields_set
+            if "dns_view" in written:
+                written = written | {"dns_view_id"}
+            watched = watched & written
+
+        if not watched:
+            super().save(*args, **kwargs)
+            return
+
+        with transaction.atomic():
+            # Lock the row so the comparison, the save and the bump all see the same stored values.
+            locked = DNSZone.objects.select_for_update().values(*watched, "soa_serial").get(pk=self.pk)
+            should_increment = any(getattr(self, field) != locked[field] for field in watched)
+
+            if should_increment or update_fields_set is None:
+                self.soa_serial = locked["soa_serial"]
+
+            super().save(*args, **kwargs)
+
+            if should_increment:
+                self.increment_soa_serial()
+            elif update_fields_set is None:
+                self._initial_soa_serial = self.soa_serial
+
+    def _managed_soa_serial_update_fields(self, update_fields_set):
+        """Return ``update_fields_set`` without ``soa_serial``, raising if the serial differs from its loaded value.
+
+        An unchanged serial is dropped rather than written, because the in-memory value can be older than the
+        stored one.
+        """
+        if update_fields_set is None or "soa_serial" not in update_fields_set:
+            return update_fields_set
+
+        if "soa_serial" not in self.get_deferred_fields():
+            baseline = self._get_soa_serial_validation_baseline()
+            if baseline is not None and self.soa_serial != baseline:
+                raise ValidationError({"soa_serial": SOA_SERIAL_MANAGED_MESSAGE})
+
+        return update_fields_set - {"soa_serial"}
+
+    def _get_soa_serial_validation_baseline(self):
+        """Return the serial as loaded from the database, or None for a new zone or a deferred serial."""
+        if self._initial_soa_serial is not None:
+            return self._initial_soa_serial
+
+        if self.present_in_database and "soa_serial" not in self.get_deferred_fields():
+            self._initial_soa_serial = DNSZone.objects.values_list("soa_serial", flat=True).get(pk=self.pk)
+            return self._initial_soa_serial
+
+        return None
+
+    def clean(self):
+        """Reject manual serial changes when auto-increment is on."""
+        super().clean()
+
+        serial_is_loaded = "soa_serial" not in self.get_deferred_fields()
+        if not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT or not serial_is_loaded:
+            return
+
+        if self.present_in_database:
+            # Compared with the serial as loaded, not the stored one, so an increment made by
+            # another transaction since the load is not mistaken for a manual change.
+            initial = self._get_soa_serial_validation_baseline()
+            if initial is not None and self.soa_serial != initial:
+                raise ValidationError({"soa_serial": SOA_SERIAL_MANAGED_MESSAGE})
+        elif self.soa_serial != self._meta.get_field("soa_serial").default:
+            # A new zone starts at the default. Onboard a zone at a specific serial with
+            # auto-increment off.
+            raise ValidationError({"soa_serial": SOA_SERIAL_MANAGED_MESSAGE})
+
 
 class DNSRecord(DNSModel):
     """Primary Dns Record model for plugin."""
@@ -220,6 +440,84 @@ class DNSRecord(DNSModel):
     )
     description = models.TextField(help_text="Description of the Record.", blank=True)
     comment = models.CharField(max_length=200, help_text="Comment for the Record.", blank=True)
+
+    # Concrete record fields that are Nautobot metadata, not part of the published DNS record.
+    # Changing only these must not advance the zone serial; "zone" is excluded because a zone
+    # change is handled separately as a move.
+    _SOA_SERIAL_NON_MATERIALIZING_FIELDS = frozenset(
+        {"id", "created", "last_updated", "_custom_field_data", "description", "comment", "zone"}
+    )
+
+    @classmethod
+    def _soa_materializing_fields(cls):
+        """Return ``(name, attname)`` for each concrete field that is published in the zone."""
+        return tuple(
+            (field.name, field.attname)
+            for field in cls._meta.concrete_fields
+            if field.name not in cls._SOA_SERIAL_NON_MATERIALIZING_FIELDS
+        )
+
+    def _soa_locked_snapshot(self):
+        """Lock this record's row and return its zone id and published values, or None if the row is gone."""
+        attnames = [attname for _, attname in self._soa_materializing_fields()]
+        return type(self).objects.select_for_update().values("zone_id", *attnames).filter(pk=self.pk).first()
+
+    def _soa_zones_to_bump(self, update_fields_set, before):
+        """Return the ids of the zones whose serial this save should advance, in primary key order.
+
+        ``before`` is the locked pre-save row, or None for a create. The stored row is read back instead of
+        using in-memory values, so an ``F()`` expression that stores the same value is not counted as a change.
+        """
+        fields = self._soa_materializing_fields()
+        if before is not None and update_fields_set is not None:
+            published = {"zone", "zone_id"}.union(*fields)
+            if not published & update_fields_set:
+                return []
+
+        attnames = [attname for _, attname in fields]
+        after = type(self).objects.values("zone_id", *attnames).filter(pk=self.pk).first()
+        if after is None:
+            return []
+
+        if before is None:
+            return [after["zone_id"]]
+
+        if before["zone_id"] != after["zone_id"]:
+            return sorted({before["zone_id"], after["zone_id"]}, key=str)
+
+        if any(after[attname] != before[attname] for attname in attnames):
+            return [after["zone_id"]]
+
+        return []
+
+    def save(self, *args, **kwargs):
+        """Save, and bump the affected zones' SOA serials when the record's published DNS data changed.
+
+        A create, a move to another zone, or a change to a published field bumps. An edit to the description,
+        comment or custom fields does not. A full save of an instance whose row was deleted since it was loaded
+        inserts the row again, and counts as a create.
+        """
+        # Materialize update_fields once, so a generator is not exhausted before super().save() reads it.
+        update_fields_set = kwargs.get("update_fields")
+        if update_fields_set is not None:
+            update_fields_set = frozenset(update_fields_set)
+            kwargs["update_fields"] = update_fields_set
+
+        if (update_fields_set is not None and not update_fields_set) or (
+            not constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT
+        ):
+            super().save(*args, **kwargs)
+            return
+
+        with transaction.atomic():
+            before = None if self._state.adding else self._soa_locked_snapshot()
+            super().save(*args, **kwargs)
+
+            for zone_id in self._soa_zones_to_bump(update_fields_set, before):
+                DNSZone.bump_zone_serial(zone_id)
+
+    # Deletion bumps through the pre_delete/post_delete receivers in signals.py, which also cover
+    # QuerySet.delete(). A delete() override here would bump a second time.
 
     def clean(self):
         """

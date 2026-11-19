@@ -84,7 +84,24 @@ class NautobotDnsModelsConfig(NautobotAppConfig):
             help_text="DNS validation level for zones and records.",
             field_type="dns_validation_level",
         ),
+        "SOA_SERIAL_AUTO_INCREMENT": ConstanceConfigItem(
+            default=False,
+            help_text=(
+                "Automatically increment SOA serial number when zone data changes. "
+                "Incompatible with date-based serial schemes (e.g., YYYYMMDDNN)."
+            ),
+            field_type=bool,
+        ),
     }
+
+    def ready(self):
+        """Connect the app's signal handlers."""
+        super().ready()
+        # Deferred for app-registry timing: `signals` imports `models`, which cannot load while this module is
+        # imported during settings setup.
+        from nautobot_dns_models.signals import connect_dns_record_signals  # pylint: disable=import-outside-toplevel
+
+        connect_dns_record_signals()
 
 
 config = NautobotDnsModelsConfig  # pylint:disable=invalid-name

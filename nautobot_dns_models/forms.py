@@ -1,5 +1,6 @@
 """Forms for nautobot_dns_models."""
 
+from constance import config as constance_config
 from django import forms
 from nautobot.apps.forms import (
     DynamicModelChoiceField,
@@ -63,6 +64,14 @@ class DNSViewFilterForm(NautobotFilterForm):
 
 class DNSZoneForm(NautobotModelForm):
     """DNSZone creation/edit form."""
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the form and disable `soa_serial` if auto-increment is enabled."""
+        super().__init__(*args, **kwargs)
+        if constance_config.nautobot_dns_models__SOA_SERIAL_AUTO_INCREMENT:
+            soa_serial = self.fields["soa_serial"]
+            soa_serial.disabled = True
+            soa_serial.help_text = "Managed automatically while SOA serial auto-increment is enabled."
 
     class Meta:
         """Meta attributes."""

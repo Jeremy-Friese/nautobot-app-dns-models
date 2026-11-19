@@ -76,3 +76,7 @@ This setting controls the DNS validation level applied to zones and records:
     - Each label (the parts of the name separated by dots) must be no more than 63 bytes in wire format
     - Empty labels (e.g., consecutive dots or leading/trailing dots) are not allowed
     - The total length of the fully qualified DNS name (including all dots, in wire format) must not exceed 255 bytes
+
+`SOA_SERIAL_AUTO_INCREMENT` (default: disabled)
+
+When enabled, a zone's SOA serial advances automatically whenever its DNS-serving data changes, and the serial is no longer manually editable. It is incompatible with date-based serial schemes (e.g. `YYYYMMDDNN`). See [SOA Serial Auto-Increment](../models/dnszone.md#soa-serial-auto-increment).
